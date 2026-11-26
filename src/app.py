@@ -1,6 +1,7 @@
 """Tkinter entry point for the NR periodic trigger."""
 
 import argparse
+import ctypes
 import os
 import platform
 import re
@@ -13,6 +14,7 @@ from queue import Empty, Queue
 from threading import Thread
 from tkinter import ttk
 
+from . import single_instance
 from .config import load_config, save_config
 from .logbook import Logbook, local_now
 from .logger_link import LoggerLink, Problem, STATE_NAMES
@@ -277,6 +279,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="NR 定期トリガー")
     parser.add_argument("--config", type=Path, default=directory / "config.json")
     args = parser.parse_args(argv)
+    instance_handle = single_instance.acquire()  # Keep it alive through mainloop.
+    if instance_handle is None:
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                None, "NR Trigger はすでに起動しています。", "NR Trigger", 0x40,  # MB_OK | MB_ICONINFORMATION
+            )
+        except Exception:
+            # Notification failure must still stop the duplicate instance.
+            pass
+        return
+
     root = tk.Tk()
     App(root, args.config, args.config.resolve().parent / "logs")
     root.mainloop()
