@@ -1,0 +1,14 @@
+# キーエンスのマニュアル類（PDF・変換MD・抽出テキスト・関数一覧）は含めない
+manuals/
+# 体験版インストーラ
+installers/
+# Python venv
+pdfenv/
+# 作業メモと Sol 相談文（過程資料）
+design-memo.md
+consult-sol-*.md
+# design.md の作業用コピー
+NR定期トリガー設計書.md
+
+__pycache__/
+*.pyc
