@@ -2,7 +2,7 @@
 
 import sys
 from concurrent.futures import Future, TimeoutError
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from queue import Empty, Queue
 from threading import Event, Lock, RLock, Thread
@@ -241,7 +241,7 @@ class _ComObject:
     """Present the server's property-style members as zero-argument callables.
 
     The WAVE LOGGER automation server exposes its no-argument members
-    (GetState, GetErrorCode, GetModuleName, GetIdentifier, and Start) as
+    (GetState, GetActiveFileType, GetErrorCode, GetModuleName, GetIdentifier, and Start) as
     COM properties: the manual writes them without parentheses
     (``Long = object.GetState``) and pywin32 returns their values on
     attribute access instead of a method object.  Verified on tanaka3
@@ -287,6 +287,7 @@ class LoggerLink:
         self.timing = timing
         self._gate = RLock()
         self._server = None  # Accessed only on the owner thread.
+        self._file_type_baseline: int | None = None  # Accessed only on the owner thread.
         self._worker = None
         self._ready = False
         self._failure = None
@@ -322,10 +323,12 @@ class LoggerLink:
 
     def _release(self):
         self._server = None
+        self._file_type_baseline = None
         with self._gate:
             self._ready = False
 
     def _link_down(self, problem):
+        self._file_type_baseline = None
         if problem.reason == DISCONNECTED:
             self._server = None
         with self._gate:
@@ -423,12 +426,18 @@ class LoggerLink:
             if values[stage] != 0:
                 problem = Problem(stage, OPERATION_ERROR, "OpenFile が失敗しました")
                 return problem
+            file_type = self._read_file_type("establish.GetActiveFileType")
+            if isinstance(file_type, Problem):
+                values["GetActiveFileType_error"] = file_type.fields()
+            else:
+                values["GetActiveFileType"] = file_type
             stage = "GetState"
             reading = self._read_state("establish.GetState")
             values[stage] = reading.state
             if not can_start(reading.state):
                 problem = reading.problem or Problem(stage, OPERATION_ERROR, f"GetState={reading.state}")
                 return problem
+            self._file_type_baseline = values.get("GetActiveFileType") or None
             self._link_up()
             return None
         except Exception as error:
@@ -444,15 +453,16 @@ class LoggerLink:
                     values["cleanup_error"] = _exception("Quit", error).fields()
                 finally:
                     self._release()
-            self._log_establish(started, values, problem)
+            self._log_establish(started, values, problem, file_type_baseline=self._file_type_baseline)
 
-    def _log_establish(self, started, values, problem):
+    def _log_establish(self, started, values, problem, *, file_type_baseline=None):
         self.log.emit(
             "establish", progid=self.config.progid, settings_file=self.config.settings_file,
             unit_id=self.config.unit_id, identifier=self.config.identifier,
             expected_identifier=self.config.expected_identifier,
             confirmed_identifier=values.get("GetIdentifier"), success=problem is None,
             failed_stage=problem.stage if problem else None, api_returns=values,
+            file_type_baseline=file_type_baseline,
             elapsed_ms=(monotonic() - started) * 1000,
             **(problem.fields() if problem else {}),
         )
@@ -477,14 +487,78 @@ class LoggerLink:
             self._link_down(problem)
         return Reading(state, observed_at, finished, problem)
 
+    def _read_file_type(self, stage):
+        try:
+            file_type = self._server.GetActiveFileType()
+        except Exception as error:
+            return _exception(stage, error, STATE_ERROR)
+        if type(file_type) is int:
+            return file_type
+        return Problem(stage, STATE_ERROR, f"GetActiveFileType={file_type!r}")
+
+    def _check_settings_file(self, ticket, deadline, fields):
+        baseline = self._file_type_baseline
+        fields["file_type_baseline"] = baseline
+        read_stage = "precheck.GetActiveFileType"
+        file_type = self._read_file_type(read_stage)
+        if isinstance(file_type, Problem):
+            self._link_down(file_type)
+            return file_type
+        fields["file_type"] = file_type
+        if file_type == baseline:
+            return None
+        if file_type != 0:
+            return Problem(
+                read_stage, OPERATION_ERROR,
+                f"GetActiveFileType={file_type}, file_type_baseline={baseline}",
+            )
+
+        stage = "precheck.OpenFile"
+        with ticket.lock:
+            if monotonic() > deadline or ticket.cancelled:
+                return Problem(stage, OPERATION_ERROR, "事前確認の期限切れ・取消")
+        fields["reopen_success"] = False
+        try:
+            retval = self._server.OpenFile(self.config.settings_file)
+        except Exception as error:
+            problem = _exception(stage, error)
+            if problem.reason == DISCONNECTED:
+                self._link_down(problem)
+            return problem
+        fields["open_file_retval"] = retval
+        if retval != 0:
+            return Problem(stage, OPERATION_ERROR, f"OpenFile={retval}")
+
+        file_type = self._read_file_type(read_stage)
+        if isinstance(file_type, Problem):
+            self._link_down(file_type)
+            return file_type
+        fields["file_type_after_reopen"] = file_type
+        if file_type != baseline:
+            return Problem(
+                read_stage, OPERATION_ERROR,
+                f"OpenFile 後の GetActiveFileType={file_type}, file_type_baseline={baseline}",
+            )
+        fields["reopen_success"] = True
+        return None
+
     def precheck(self, ticket, deadline):
         def read():
             with ticket.lock:
                 if monotonic() > deadline or ticket.cancelled:
                     return Problem("precheck.GetState", OPERATION_ERROR, "事前確認の期限切れ・取消")
             reading = self._read_state("precheck.GetState")
-            self.log.emit("precheck", **ticket.fields(), **reading.fields())
-            return reading
+            fields = reading.fields()
+            result = reading
+            if reading.problem is None and self._file_type_baseline is not None:
+                problem = self._check_settings_file(ticket, deadline, fields)
+                if problem is None:
+                    result = replace(reading, finished=monotonic())
+                else:
+                    fields.update(problem.fields())
+                    result = problem
+            self.log.emit("precheck", **ticket.fields(), **fields)
+            return result
 
         with self._gate:
             if self._closing or self._firing or not self._ready:

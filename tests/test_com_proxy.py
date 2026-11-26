@@ -21,6 +21,10 @@ class FakeServer:
         return 1
 
     @property
+    def GetActiveFileType(self):
+        return 2
+
+    @property
     def GetIdentifier(self):
         return self.identifier
 
@@ -37,6 +41,7 @@ class FakeServer:
 def test_property_members_become_callables():
     proxy = _ComObject(FakeServer())
     assert proxy.GetState() == 1
+    assert proxy.GetActiveFileType() == 2
     assert proxy.GetIdentifier() == 255
 
 

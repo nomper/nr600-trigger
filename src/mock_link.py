@@ -12,7 +12,7 @@ class _Disconnected(Exception):
 
 
 class MockLink(LoggerLink):
-    def __init__(self, config, log, *, scenario=None, timing=Timing()):
+    def __init__(self, config, log, *, scenario=None, timing=Timing(), settings_file_type=2):
         super().__init__(config, log, timing=timing)
         self.scenario = scenario or config.mock or MockConfig()
         self.start_called = Event()
@@ -20,6 +20,10 @@ class MockLink(LoggerLink):
         self.start_count = 0
         self.quit_count = 0
         self.state = 1
+        self.settings_file_type = settings_file_type
+        self.file_type = 0
+        self.reopen_count = 0
+        self.reopen_fails = False
         self.disconnect = Event()
         self._disconnect_once = self.scenario.scenario == "disconnect"
 
@@ -56,7 +60,15 @@ class _MockServer:
         return self.link.config.expected_identifier
 
     def OpenFile(self, path):
+        if self.established:
+            self.link.reopen_count += 1
+            if self.link.reopen_fails:
+                return 1
+        self.link.file_type = self.link.settings_file_type
         return 0
+
+    def GetActiveFileType(self):
+        return self.link.file_type
 
     def GetState(self):
         link = self.link
@@ -87,6 +99,8 @@ class _MockServer:
             link.resume_start.wait()
         if scenario == "disconnect_on_start":
             raise _Disconnected("mock: Start 中に切断")
+        if link.file_type == 0 or link.file_type != link.settings_file_type:
+            return 1
         if scenario == "start_failure":
             return -3
         if scenario not in {"unconfirmed", "disconnect_after_start"}:

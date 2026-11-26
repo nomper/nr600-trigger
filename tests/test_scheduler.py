@@ -7,7 +7,9 @@ import pytest
 
 from src.config import MockConfig
 from src.logbook import Logbook
-from src.logger_link import CONFIRMED, DISCONNECTED, FAILED, SKIPPED, UNCONFIRMED, UNKNOWN, Timing
+from src.logger_link import (
+    CONFIRMED, DISCONNECTED, FAILED, OPERATION_ERROR, SKIPPED, UNCONFIRMED, UNKNOWN, Timing,
+)
 from src.mock_link import MockLink
 from src.scheduler import Scheduler
 
@@ -36,10 +38,12 @@ def wait_for(predicate, timeout=2.5):
 def rig(config, tmp_path):
     resources = []
 
-    def create(scenario="normal", *, cron=None, seconds_to_grid=0.45, delay=0.5):
+    def create(scenario="normal", *, cron=None, seconds_to_grid=0.45, delay=0.5, settings_file_type=2):
         active = replace(config, mock=MockConfig(scenario, delay), cron=cron or config.cron)
         log = Logbook(tmp_path)
-        link = MockLink(active, log, timing=Timing(0.10, 0.15, 0.02, 0.20))
+        link = MockLink(
+            active, log, timing=Timing(0.10, 0.15, 0.02, 0.20), settings_file_type=settings_file_type,
+        )
         clock = Clock(datetime(2026, 11, 26, 8) - timedelta(seconds=seconds_to_grid))
         scheduler = Scheduler(active, link, log, clock=clock)
         resources.append((scheduler, link, log))
@@ -89,7 +93,9 @@ def test_scheduled_result(rig, scenario, result, starts):
     if scenario == "busy":
         assert "GetState=4" in event["reason"]
     if scenario == "normal":
-        assert events(log, "precheck")
+        checks = events(log, "precheck")
+        assert checks and all(check["file_type"] == 2 for check in checks)
+        assert link.reopen_count == 0
         assert events(log, "observe")[0]["state"] == 4
         assert 0 <= (clock() - event["scheduled_at"]).total_seconds() < 0.15
     if scenario == "start_failure":
@@ -102,6 +108,72 @@ def test_scheduled_result(rig, scenario, result, starts):
         wait_for(lambda: link.connected)
         assert len(events(log, "establish")) == 2
         assert events(log, "link_up")[-1]["down_ms"] > 0
+
+
+@pytest.mark.parametrize("baseline", [1, 3])
+def test_scheduled_result_with_matching_file_type(rig, baseline):
+    scheduler, link, log, _ = rig(settings_file_type=baseline)
+
+    assert scheduler.start()
+    event = log.results.get(timeout=2.5)
+    assert event["result"] == CONFIRMED
+    assert link.start_count == 1 and link.reopen_count == 0
+    [established] = events(log, "establish")
+    assert established["file_type_baseline"] == baseline
+    checks = events(log, "precheck")
+    assert checks and all(check["file_type"] == check["file_type_baseline"] == baseline for check in checks)
+
+
+@pytest.mark.parametrize(("baseline", "reopen_fails", "result", "starts"), [
+    (1, False, CONFIRMED, 1),
+    (2, False, CONFIRMED, 1),
+    (3, False, CONFIRMED, 1),
+    (2, True, SKIPPED, 0),
+])
+def test_scheduled_result_after_settings_file_is_closed(rig, baseline, reopen_fails, result, starts):
+    scheduler, link, log, _ = rig(settings_file_type=baseline)
+    assert link.establish().result(timeout=1) is None
+    link.file_type = 0
+    link.reopen_fails = reopen_fails
+
+    assert scheduler.start()
+    event = log.results.get(timeout=2.5)
+    assert event["result"] == result
+    assert link.reopen_count == 1
+    assert link.start_count == starts
+    [attempt] = [check for check in events(log, "precheck") if "reopen_success" in check]
+    assert attempt["fire_id"] == event["fire_id"]
+    assert attempt["file_type"] == 0
+    assert attempt["file_type_baseline"] == baseline
+    assert attempt["reopen_success"] is (not reopen_fails)
+    if reopen_fails:
+        assert event["stage"] == "precheck.OpenFile"
+        assert event["reason"] == OPERATION_ERROR
+        assert attempt["open_file_retval"] == 1
+        assert "file_type_after_reopen" not in attempt
+        assert not events(log, "fire")
+    else:
+        assert attempt["open_file_retval"] == 0
+        assert attempt["file_type_after_reopen"] == baseline
+
+
+@pytest.mark.parametrize(("baseline", "active_type"), [(1, 2), (3, 1)])
+def test_scheduled_result_with_different_active_file_type(rig, baseline, active_type):
+    scheduler, link, log, _ = rig(settings_file_type=baseline)
+    assert link.establish().result(timeout=1) is None
+    link.file_type = active_type
+
+    assert scheduler.start()
+    event = log.results.get(timeout=2.5)
+    assert event["result"] == SKIPPED
+    assert event["stage"] == "precheck.GetActiveFileType"
+    assert event["reason"] == OPERATION_ERROR
+    assert link.reopen_count == 0 and link.start_count == 0
+    assert link.connected and link.file_type == active_type
+    [check] = events(log, "precheck")
+    assert check["fire_id"] == event["fire_id"]
+    assert check["file_type"] == active_type
+    assert check["file_type_baseline"] == baseline
 
 
 @pytest.mark.parametrize(("initial", "final", "result"), [(4, 1, CONFIRMED), (1, 10, SKIPPED), (1, 2, SKIPPED)])

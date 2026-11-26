@@ -1,9 +1,9 @@
 # NR-500/600 定期トリガーアプリ 詳細設計書
 
-版: 0.7（単一起動ガードを追加）
+版: 0.8（D2 対策を基準値方式で追加）
 日付: 2026-11-26
 上位文書: 設計書 v1.6（design.md）
-使用関数: used-functions.md（必須10・条件付き2・任意3の計15関数）
+使用関数: used-functions.md（必須11・条件付き2・任意3の計16関数）
 
 ## 1. モジュール構成
 
@@ -34,8 +34,8 @@
 
 | 操作 | 中で使う関数 | 戻り |
 |---|---|---|
-| establish | DispatchEx → Initialize → DisplayAlerts／Visible 設定 → SetIdentifier → GetIdentifier 確認 → OpenFile → GetState | 確立の成否と失敗段階、各戻り値 |
-| precheck | GetState | 最新の状態値 |
+| establish | DispatchEx → Initialize → DisplayAlerts／Visible 設定 → SetIdentifier → GetIdentifier 確認 → OpenFile → GetState → GetActiveFileType（ファイル型の基準値を取り込む） | 確立の成否と失敗段階、各戻り値 |
+| precheck | GetState、GetActiveFileType（基準値と照合。0 なら OpenFile で一度だけ開き直す） | 最新の状態値 |
 | fire | Start → GetState ポーリング →（異常停止時）GetErrorCode | 結果区分（第4節） |
 | stop_collect | Stop | 成否 |
 | snapshot | GetState、GetModuleName、GetUnitInfo | 画面表示・ログ用の現在状態 |
