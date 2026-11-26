@@ -280,6 +280,61 @@ def test_stop_invalidates_prechecked_grid(rig):
     assert scheduler.snapshot().result(timeout=1)["state"] == 1
 
 
+def test_stop_before_first_interval_grid_can_restart_at_same_time(rig):
+    scheduler, link, log, clock = rig(
+        seconds_to_grid=10, mode="interval", anchor="20261126 080000", interval_minutes=7,
+    )
+    first_at = datetime(2026, 11, 26, 8).astimezone()
+    assert scheduler.start()
+    assert scheduler.next_at == first_at
+    wait_for(lambda: scheduler.status == "待機中")
+
+    scheduler.stop()
+    cancelled = log.results.get(timeout=1)
+    assert cancelled["scheduled_at"] == first_at
+    assert cancelled["result"] == SKIPPED
+    assert "取消" in cancelled["reason"]
+    assert link.start_count == 0
+
+    assert scheduler.start()
+    assert scheduler.next_at == first_at
+    clock.jump((first_at - clock()).total_seconds() - 0.45)
+    fired = log.results.get(timeout=2.5)
+    assert fired["scheduled_at"] == first_at
+    assert fired["result"] == CONFIRMED
+    assert fired["fire_id"] != cancelled["fire_id"]
+    assert scheduler.next_at == first_at + timedelta(minutes=7)
+    assert link.start_count == 1
+
+
+def test_initial_establish_failure_can_retry_at_same_interval_grid(rig):
+    scheduler, link, log, clock = rig(
+        seconds_to_grid=10, mode="interval", anchor="20261126 080000", interval_minutes=7,
+    )
+    first_at = datetime(2026, 11, 26, 8).astimezone()
+    link.state = 10
+    assert scheduler.start()
+    skipped = log.results.get(timeout=1)
+    assert skipped["scheduled_at"] == first_at
+    assert skipped["result"] == SKIPPED
+    assert skipped["reason"] == "確立失敗"
+    assert not scheduler.active
+    assert not link.connected
+    assert link.start_count == 0
+
+    link.state = 1
+    assert scheduler.start()
+    assert scheduler.next_at == first_at
+    wait_for(lambda: scheduler.status == "待機中")
+    clock.jump((first_at - clock()).total_seconds() - 0.45)
+    fired = log.results.get(timeout=2.5)
+    assert fired["scheduled_at"] == first_at
+    assert fired["result"] == CONFIRMED
+    assert fired["fire_id"] != skipped["fire_id"]
+    assert scheduler.next_at == first_at + timedelta(minutes=7)
+    assert link.start_count == 1
+
+
 def test_lead_starts_precheck_and_suppresses_snapshot(rig):
     scheduler, link, log, clock = rig(seconds_to_grid=8)
     assert scheduler.start()

@@ -112,7 +112,8 @@ class Scheduler:
         self._starting = False
         for plan in (self._next, self._manual):
             if plan is not None:
-                self._record(plan, FireResult(SKIPPED, reason))
+                remember_grid = plan.grid is not None and plan.grid <= _wall(self._clock())
+                self._record(plan, FireResult(SKIPPED, reason), remember_grid=remember_grid)
         self._next = self._manual = None
         if self._flight:
             self._flight[0].ticket.cancel()
@@ -369,9 +370,9 @@ class Scheduler:
             self._record(plan, result.result())
             self._sync_protection()
 
-    def _record(self, plan, outcome):
+    def _record(self, plan, outcome, *, remember_grid=True):
         plan.ticket.cancel()
-        if plan.grid is not None:
+        if remember_grid and plan.grid is not None:
             if plan.grid in self._done:
                 return
             self._done.add(plan.grid)
