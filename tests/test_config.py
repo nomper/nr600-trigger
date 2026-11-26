@@ -13,6 +13,12 @@ def test_identifier(config, model, offset):
         assert replace(config, logger_model=model, unit_id=unit_id).identifier == offset + unit_id
 
 
+@pytest.mark.parametrize(("model", "offset"), [("NR-500", 0), ("NR-600", 8)])
+def test_expected_identifier(config, model, offset):
+    for unit_id in range(4):
+        assert replace(config, logger_model=model, unit_id=unit_id).expected_identifier == offset + unit_id
+
+
 @pytest.mark.parametrize(("key", "value"), [
     ("version", True), ("version", 2), ("unit_id", True), ("unit_id", 4),
     ("unit_id", -1), ("logger_model", "NR-X"), ("lead_seconds", 2),

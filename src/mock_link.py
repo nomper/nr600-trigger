@@ -48,7 +48,12 @@ class _MockServer:
         return 0
 
     def GetIdentifier(self):
-        return self.identifier
+        # Emulate the observed server: unset is 255, and a successful
+        # SetIdentifier is reported back in the expected-value space
+        # (see Config.expected_identifier), not as the raw argument.
+        if self.identifier is None:
+            return 255
+        return self.link.config.expected_identifier
 
     def OpenFile(self, path):
         return 0

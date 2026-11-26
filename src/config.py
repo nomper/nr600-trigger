@@ -127,6 +127,20 @@ class Config:
     def identifier(self) -> int:
         return self.unit_id + (4 if self.logger_model == "NR-600" else 0)
 
+    @property
+    def expected_identifier(self) -> int:
+        """Value GetIdentifier must return for establish to succeed.
+
+        This is a different numbering space from the SetIdentifier
+        argument.  Observed on the trial server (tanaka3, 2026-11-26):
+        NR-600 reported 8 + unit_id for both USB and LAN settings, so
+        the establish check compares against this expected value rather
+        than the value passed to SetIdentifier.  The trial cannot
+        emulate an NR-500, so NR-500 follows the manual (the physical
+        ID itself) until the product unit is checked at acceptance.
+        """
+        return self.unit_id + (8 if self.logger_model == "NR-600" else 0)
+
 
 def load_config(path: Path | str) -> Config:
     with Path(path).open(encoding="utf-8-sig") as file:

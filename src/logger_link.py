@@ -415,7 +415,7 @@ class LoggerLink:
                 return problem
             stage = "GetIdentifier"
             values[stage] = self._server.GetIdentifier()
-            if values[stage] != self.config.identifier:
+            if values[stage] != self.config.expected_identifier:
                 problem = Problem(stage, OPERATION_ERROR, "機器 ID が一致しません")
                 return problem
             stage = "OpenFile"
@@ -450,6 +450,7 @@ class LoggerLink:
         self.log.emit(
             "establish", progid=self.config.progid, settings_file=self.config.settings_file,
             unit_id=self.config.unit_id, identifier=self.config.identifier,
+            expected_identifier=self.config.expected_identifier,
             confirmed_identifier=values.get("GetIdentifier"), success=problem is None,
             failed_stage=problem.stage if problem else None, api_returns=values,
             elapsed_ms=(monotonic() - started) * 1000,
