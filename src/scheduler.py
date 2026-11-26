@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from threading import Event, RLock, Thread
 from time import monotonic
 
-from .config import Config, cron_schedule
+from .config import Config
 from .logger_link import (
     DISCONNECTED, SKIPPED, FireResult, FireTicket, Problem, Reading, can_start,
 )
@@ -91,9 +91,13 @@ class Scheduler:
             self._active = True
             self._starting = True
             self.status = "確立中"
+            if self.config.mode == "cron":
+                schedule = {"cron": self.config.cron}
+            else:
+                schedule = {"anchor": self.config.anchor, "interval_minutes": self.config.interval_minutes}
             self.log.emit(
                 "manual", operation="スケジューラ開始",
-                cron=self.config.cron, lead_seconds=self.config.lead_seconds,
+                mode=self.config.mode, lead_seconds=self.config.lead_seconds, **schedule,
             )
             self._wake.set()
             return True
@@ -175,11 +179,10 @@ class Scheduler:
         return closed
 
     def _next_after(self, base, wall, now):
-        times = cron_schedule(self.config.cron, base)
-        grid = times.get_next(datetime)
+        grid = self.config.next_fire_after(base)
         in_flight = self._flight[0].grid if self._flight else None
         while grid in self._done or grid == in_flight:
-            grid = times.get_next(datetime)
+            grid = self.config.next_fire_after(grid)
         ticket = FireTicket(_local_grid(grid, self._clock()))
         return _Plan(ticket, now + (grid - wall).total_seconds(), grid)
 

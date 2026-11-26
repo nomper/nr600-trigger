@@ -38,8 +38,8 @@ def wait_for(predicate, timeout=2.5):
 def rig(config, tmp_path):
     resources = []
 
-    def create(scenario="normal", *, cron=None, seconds_to_grid=0.45, delay=0.5, settings_file_type=2):
-        active = replace(config, mock=MockConfig(scenario, delay), cron=cron or config.cron)
+    def create(scenario="normal", *, seconds_to_grid=0.45, delay=0.5, settings_file_type=2, **schedule):
+        active = replace(config, mock=MockConfig(scenario, delay), **schedule)
         log = Logbook(tmp_path)
         link = MockLink(
             active, log, timing=Timing(0.10, 0.15, 0.02, 0.20), settings_file_type=settings_file_type,
@@ -93,6 +93,8 @@ def test_scheduled_result(rig, scenario, result, starts):
     if scenario == "busy":
         assert "GetState=4" in event["reason"]
     if scenario == "normal":
+        [started] = events(log, "manual")
+        assert started["mode"] == "cron" and started["cron"] == scheduler.config.cron
         checks = events(log, "precheck")
         assert checks and all(check["file_type"] == 2 for check in checks)
         assert link.reopen_count == 0
@@ -108,6 +110,35 @@ def test_scheduled_result(rig, scenario, result, starts):
         wait_for(lambda: link.connected)
         assert len(events(log, "establish")) == 2
         assert events(log, "link_up")[-1]["down_ms"] > 0
+
+
+@pytest.mark.parametrize("skip_middle", [False, True], ids=["all-fire", "skip-while-collecting"])
+def test_interval_schedule_preserves_anchor(rig, skip_middle):
+    scheduler, link, log, clock = rig(mode="interval", anchor="20261126 080000", interval_minutes=7)
+    anchor = datetime(2026, 11, 26, 8).astimezone()
+    interval = timedelta(minutes=7)
+
+    assert scheduler.start()
+    for index in range(3):
+        scheduled = anchor + index * interval
+        should_skip = skip_middle and index == 1
+        if index > 0:
+            if not should_skip:
+                assert scheduler.stop_collect().result(timeout=1) is None
+            clock.jump((scheduled - clock()).total_seconds() - 0.45)
+
+        event = log.results.get(timeout=2.5)
+        assert event["scheduled_at"] == scheduled
+        assert event["result"] == (SKIPPED if should_skip else CONFIRMED)
+        if should_skip:
+            assert "GetState=4" in event["reason"]
+            assert event["call_started_at"] is None
+        assert scheduler.next_at == scheduled + interval
+
+    assert link.start_count == (2 if skip_middle else 3)
+    [started] = [event for event in events(log, "manual") if event["operation"] == "スケジューラ開始"]
+    assert (started["mode"], started["anchor"], started["interval_minutes"]) == ("interval", "20261126 080000", 7)
+    assert "cron" not in started
 
 
 @pytest.mark.parametrize("baseline", [1, 3])

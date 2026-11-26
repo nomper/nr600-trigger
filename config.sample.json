@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "progid": "WaveLoggerPro2.Application",
+  "settings_file": "C:\\NR-Trigger\\settings.ucf",
+  "logger_model": "NR-600",
+  "unit_id": 0,
+  "cron": "0 * * * * *",
+  "mode": "cron",
+  "anchor": null,
+  "interval_minutes": null,
+  "lead_seconds": 5,
+  "visible": false,
+  "log_retention_days": 30
+}

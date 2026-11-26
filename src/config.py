@@ -5,7 +5,7 @@ import math
 import re
 from calendar import monthrange
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -73,6 +73,34 @@ def cron_schedule(expression: str, base: datetime):
     return croniter(normalized, base, second_at_beginning=True, day_or=day_or)
 
 
+def parse_anchor(text: str) -> datetime:
+    """Parse an anchor as a local wall-clock time."""
+    if isinstance(text, str):
+        text = text.strip()
+        for pattern, date_format in (
+            (r"[0-9]{8} [0-9]{6}", "%Y%m%d %H%M%S"),
+            (r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}", "%Y-%m-%d %H:%M:%S"),
+            (r"[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}", "%Y/%m/%d %H:%M:%S"),
+        ):
+            if re.fullmatch(pattern, text):
+                try:
+                    return datetime.strptime(text, date_format)
+                except ValueError:
+                    break
+    raise ValueError(
+        "anchor（開始日時）は有効な日時を yyyymmdd hhmmss、yyyy-mm-dd hh:mm:ss、"
+        "または yyyy/mm/dd hh:mm:ss で指定してください"
+    )
+
+
+def interval_next(anchor: datetime, interval_minutes: int, base: datetime) -> datetime:
+    """Return the first slot strictly after base on the anchor's interval grid."""
+    if base < anchor:
+        return anchor
+    interval = timedelta(minutes=interval_minutes)
+    return anchor + interval * ((base - anchor) // interval + 1)
+
+
 @dataclass(frozen=True)
 class MockConfig:
     scenario: str = "normal"
@@ -93,7 +121,10 @@ class Config:
     settings_file: str
     logger_model: str
     unit_id: int
-    cron: str
+    cron: str = ""
+    mode: str = "cron"
+    anchor: str | None = None
+    interval_minutes: int | None = None
     lead_seconds: int = 5
     visible: bool = True
     log_retention_days: int = 30
@@ -102,7 +133,7 @@ class Config:
     def __post_init__(self):
         if type(self.version) is not int or self.version != 1:
             raise ValueError("version は 1 を指定してください")
-        for field in ("progid", "settings_file", "cron"):
+        for field in ("progid", "settings_file"):
             value = getattr(self, field)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{field} は空でない文字列を指定してください")
@@ -118,10 +149,24 @@ class Config:
             raise ValueError("log_retention_days は 1 以上の整数を指定してください")
         if self.mock is not None and not isinstance(self.mock, MockConfig):
             raise ValueError("mock は設定オブジェクトを指定してください")
-        try:
-            cron_schedule(self.cron, datetime.now()).get_next(datetime)
-        except (CroniterError, ValueError, OverflowError) as error:
-            raise ValueError(f"cron が不正です: {error}") from error
+        if self.mode not in ("cron", "interval"):
+            raise ValueError("mode は cron または interval を指定してください")
+        if self.mode == "cron":
+            if not isinstance(self.cron, str) or not self.cron.strip():
+                raise ValueError("cron は空でない文字列を指定してください")
+            try:
+                cron_schedule(self.cron, datetime.now()).get_next(datetime)
+            except (CroniterError, ValueError, OverflowError) as error:
+                raise ValueError(f"cron が不正です: {error}") from error
+        else:
+            parse_anchor(self.anchor)
+            if type(self.interval_minutes) is not int or self.interval_minutes < 1:
+                raise ValueError("interval_minutes（間隔）は 1 以上の整数を指定してください")
+
+    def next_fire_after(self, base: datetime) -> datetime:
+        if self.mode == "cron":
+            return cron_schedule(self.cron, base).get_next(datetime)
+        return interval_next(parse_anchor(self.anchor), self.interval_minutes, base)
 
     @property
     def identifier(self) -> int:

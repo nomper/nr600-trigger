@@ -72,7 +72,10 @@ class App:
         self.connection = tk.StringVar(value="未確立")
         self.details = tk.StringVar()
         self.state = tk.StringVar(value="—")
+        self.mode = tk.StringVar(value="cron")
         self.cron = tk.StringVar()
+        self.anchor = tk.StringVar()
+        self.interval = tk.StringVar()
         self.lead = tk.StringVar()
         self.next_time = tk.StringVar(value="—")
         self.status = tk.StringVar(value="停止中")
@@ -82,16 +85,23 @@ class App:
             self.log = Logbook(log_directory, self.config.log_retention_days)
             link = MockLink(self.config, self.log) if self.config.mock else LoggerLink(self.config, self.log)
             self.scheduler = Scheduler(self.config, link, self.log)
+            self.mode.set(self.config.mode)
             self.cron.set(self.config.cron)
+            self.anchor.set("" if self.config.anchor is None else self.config.anchor)
+            self.interval.set("" if self.config.interval_minutes is None else str(self.config.interval_minutes))
             self.lead.set(str(self.config.lead_seconds))
             settings = PureWindowsPath(self.config.settings_file).name
             self.details.set(f"{settings}  /  {self.config.logger_model} ID {self.config.unit_id}")
+            interval_fields = {}
+            if self.config.mode == "interval":
+                interval_fields = {"anchor": self.config.anchor, "interval_minutes": self.config.interval_minutes}
             self.log.emit(
                 "config", app_build=BUILD, windows_version=platform.win32_ver()[1] or None,
                 software_version="mock" if self.config.mock else _software_version(self.config.progid),
-                logger_model=self.config.logger_model, progid=self.config.progid, cron=self.config.cron,
+                logger_model=self.config.logger_model, progid=self.config.progid,
+                mode=self.config.mode, cron=self.config.cron,
                 timezone=local_now().tzname(), timezone_names=time.tzname,
-                lead_seconds=self.config.lead_seconds,
+                lead_seconds=self.config.lead_seconds, **interval_fields,
             )
         except (OSError, ValueError) as error:
             self._message = f"設定を読み込めません。{error}"
@@ -115,12 +125,27 @@ class App:
         editor = ttk.Frame(frame)
         editor.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 4))
         editor.columnconfigure(1, weight=1)
-        ttk.Label(editor, text="cron（秒先頭）").grid(row=0, column=0, padx=(0, 8))
-        self.cron_entry = ttk.Entry(editor, textvariable=self.cron)
-        self.cron_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Label(editor, text="方式").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        modes = ttk.Frame(editor)
+        modes.grid(row=0, column=1, sticky="w")
+        self.cron_radio = ttk.Radiobutton(modes, text="cron 指定", variable=self.mode, value="cron")
+        self.interval_radio = ttk.Radiobutton(modes, text="間隔指定", variable=self.mode, value="interval")
+        self.cron_radio.pack(side="left", padx=(0, 8))
+        self.interval_radio.pack(side="left")
         ttk.Label(editor, text="リード秒数").grid(row=0, column=2, padx=8)
         self.lead_entry = ttk.Spinbox(editor, from_=3, to=5, textvariable=self.lead, width=4)
         self.lead_entry.grid(row=0, column=3)
+
+        ttk.Label(editor, text="cron（秒先頭）").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        self.cron_entry = ttk.Entry(editor, textvariable=self.cron)
+        self.cron_entry.grid(row=1, column=1, columnspan=3, sticky="ew", pady=3)
+
+        ttk.Label(editor, text="開始日時").grid(row=2, column=0, sticky="w", padx=(0, 8))
+        self.anchor_entry = ttk.Entry(editor, textvariable=self.anchor)
+        self.anchor_entry.grid(row=2, column=1, sticky="ew")
+        ttk.Label(editor, text="間隔（分）").grid(row=2, column=2, padx=8)
+        self.interval_entry = ttk.Spinbox(editor, from_=1, to=99999, textvariable=self.interval, width=6)
+        self.interval_entry.grid(row=2, column=3)
 
         controls = ttk.Frame(frame)
         controls.grid(row=6, columnspan=2, sticky="ew", pady=(3, 8))
@@ -151,7 +176,19 @@ class App:
 
     def _start(self):
         try:
-            config = replace(self.config, cron=self.cron.get(), lead_seconds=int(self.lead.get()))
+            mode = self.mode.get()
+            interval = self.interval.get().strip()
+            try:
+                interval_minutes = int(interval) if interval else None
+            except ValueError:
+                if mode == "interval":
+                    raise
+                # An inactive interval value must not prevent starting cron.
+                interval_minutes = self.config.interval_minutes
+            config = replace(
+                self.config, mode=mode, cron=self.cron.get(), anchor=self.anchor.get().strip() or None,
+                interval_minutes=interval_minutes, lead_seconds=int(self.lead.get()),
+            )
             if config != self.config:
                 save_config(config, self.config_path)
         except (OSError, ValueError) as error:
@@ -236,17 +273,22 @@ class App:
 
         ready = self.scheduler is not None and not self._closing
         running = ready and self.scheduler.active
+        editable = ready and not running
+        mode = self.mode.get()
         self.status.set(
             "終了処理中" if self._closing else (
                 self._message or (self.scheduler.status if self.scheduler else "停止中")
             )
         )
         for widget, enabled in (
-            (self.start_button, ready and not running), (self.stop_button, running),
+            (self.start_button, editable), (self.stop_button, running),
             (self.send_button, ready),
             (self.collect_button, ready and self._stop is None and self.scheduler.link.connected),
             (self.close_button, not self._closing),
-            (self.cron_entry, ready and not running), (self.lead_entry, ready and not running),
+            (self.cron_radio, editable), (self.interval_radio, editable), (self.lead_entry, editable),
+            (self.cron_entry, editable and mode == "cron"),
+            (self.anchor_entry, editable and mode == "interval"),
+            (self.interval_entry, editable and mode == "interval"),
         ):
             widget.state(("!disabled",) if enabled else ("disabled",))
         self.root.after(100, self._poll)
