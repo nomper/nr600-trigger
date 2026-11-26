@@ -4,8 +4,17 @@
 
 - 設計書：[design.md](design.md)
 - 詳細設計書：[detail-design.md](detail-design.md)
+- 手順書：[手順書.md](手順書.md)
 - 対象：NR-600 または NR-500 のいずれか1台（USB 接続、常時接続前提）
 - 方式：グリッド式スケジュールで発火直前に接続を事前確立し、WAVE LOGGER PRO へ開始要求を送る。収録条件はソフト側の設定ファイルで固定し、収録中の回はスキップする
+
+![メイン画面](docs/images/main-window.png)
+
+## 入手と導入
+
+実行ファイルは [Releases](../../releases) から zip で取得します。解凍してフォルダごと配置し、`config.sample.json` を `config.json` にコピーして編集すれば使えます。導入と運用の詳細は[手順書](手順書.md)を参照してください（WAVE LOGGER PRO 側の準備や、初回だけ必要な手動起動の手順を含みます）。
+
+現行版 v0.1.0 は体験版 WAVE LOGGER PRO の環境で検証済みで、製品版＋実機での受入確認はこれからです。
 
 ## 参考資料（外部リンク）
 
