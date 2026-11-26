@@ -25,6 +25,10 @@ from .scheduler import Scheduler
 BUILD = "step1"
 
 
+def initial_anchor(saved_anchor: str | None, launch_text: str) -> str:
+    return saved_anchor or launch_text
+
+
 def _software_version(progid):
     if sys.platform != "win32":
         return None
@@ -61,6 +65,7 @@ def _software_version(progid):
 
 class App:
     def __init__(self, root, config_path, log_directory):
+        self._launch_text = local_now().strftime("%Y%m%d %H%M%S")
         self.root = root
         self.config_path = config_path
         self.scheduler = self.log = self.config = None
@@ -87,7 +92,7 @@ class App:
             self.scheduler = Scheduler(self.config, link, self.log)
             self.mode.set(self.config.mode)
             self.cron.set(self.config.cron)
-            self.anchor.set("" if self.config.anchor is None else self.config.anchor)
+            self.anchor.set(initial_anchor(self.config.anchor, self._launch_text))
             self.interval.set("" if self.config.interval_minutes is None else str(self.config.interval_minutes))
             self.lead.set(str(self.config.lead_seconds))
             settings = PureWindowsPath(self.config.settings_file).name
@@ -129,7 +134,9 @@ class App:
         modes = ttk.Frame(editor)
         modes.grid(row=0, column=1, sticky="w")
         self.cron_radio = ttk.Radiobutton(modes, text="cron 指定", variable=self.mode, value="cron")
-        self.interval_radio = ttk.Radiobutton(modes, text="間隔指定", variable=self.mode, value="interval")
+        self.interval_radio = ttk.Radiobutton(
+            modes, text="間隔指定", variable=self.mode, value="interval", command=self._fill_anchor,
+        )
         self.cron_radio.pack(side="left", padx=(0, 8))
         self.interval_radio.pack(side="left")
         ttk.Label(editor, text="リード秒数").grid(row=0, column=2, padx=8)
@@ -173,6 +180,10 @@ class App:
         button = ttk.Button(parent, text=text, command=command)
         button.pack(side="left", padx=(0, 5))
         return button
+
+    def _fill_anchor(self):
+        if not self.anchor.get().strip():
+            self.anchor.set(self._launch_text)
 
     def _start(self):
         try:
