@@ -114,7 +114,7 @@ class App:
         self._poll_snapshot()
 
     def _build(self):
-        self.root.title("NR 定期トリガー")
+        self.root.title("NR-Trigger")
         self.root.minsize(640, 350)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         frame = ttk.Frame(self.root, padding=12)
@@ -338,7 +338,7 @@ class App:
 
 def main(argv=None):
     directory = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description="NR 定期トリガー")
+    parser = argparse.ArgumentParser(description="NR-Trigger")
     parser.add_argument("--config", type=Path, default=directory / "config.json")
     args = parser.parse_args(argv)
     instance_handle = single_instance.acquire()  # Keep it alive through mainloop.
