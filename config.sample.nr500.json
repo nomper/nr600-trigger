@@ -1,0 +1,1 @@
+{"anchor":null,"cron":"0 * * * * *","interval_minutes":null,"lead_seconds":5,"link_mode":"simple","log_retention_days":30,"logger_model":"NR-500","mode":"cron","progid":"WaveLogger2.Application","settings_file":"C:\\NR-Trigger\\settings.xcf","unit_id":0,"version":1,"visible":false}

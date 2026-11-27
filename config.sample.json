@@ -10,5 +10,6 @@
   "interval_minutes": null,
   "lead_seconds": 5,
   "visible": false,
-  "log_retention_days": 30
+  "log_retention_days": 30,
+  "link_mode": "full"
 }
