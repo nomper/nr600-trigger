@@ -1,0 +1,1 @@
+{"anchor":null,"cron":"0 * * * * *","interval_minutes":null,"lead_seconds":5,"link_mode":"full","log_retention_days":30,"logger_model":"NR-X100","mode":"cron","progid":"WaveLoggerX.Application","settings_file":"C:\\NR-Trigger\\settings.ycf","unit_id":0,"version":1,"visible":false}
