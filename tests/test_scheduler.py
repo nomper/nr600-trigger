@@ -1,6 +1,8 @@
 import json
+from concurrent.futures import Future
 from dataclasses import replace
 from datetime import datetime, timedelta
+from threading import Event
 from time import monotonic, sleep
 
 import pytest
@@ -8,9 +10,9 @@ import pytest
 from src.config import MockConfig
 from src.logbook import Logbook
 from src.logger_link import (
-    CONFIRMED, DISCONNECTED, FAILED, OPERATION_ERROR, SKIPPED, UNCONFIRMED, UNKNOWN, Timing,
+    CONFIRMED, DISCONNECTED, FAILED, OPERATION_ERROR, SKIPPED, UNCONFIRMED, UNKNOWN, Problem, Timing,
 )
-from src.mock_link import MockLink
+from src.mock_link import MockLink, _MockServer
 from src.scheduler import Scheduler
 
 
@@ -38,13 +40,16 @@ def wait_for(predicate, timeout=2.5):
 def rig(config, tmp_path):
     resources = []
 
-    def create(scenario="normal", *, seconds_to_grid=0.45, delay=0.5, settings_file_type=2, **schedule):
+    def create(
+        scenario="normal", *, grid_at=datetime(2026, 11, 26, 8), seconds_to_grid=0.45,
+        delay=0.5, settings_file_type=2, **schedule,
+    ):
         active = replace(config, mock=MockConfig(scenario, delay), **schedule)
         log = Logbook(tmp_path)
         link = MockLink(
             active, log, timing=Timing(0.10, 0.15, 0.02, 0.20), settings_file_type=settings_file_type,
         )
-        clock = Clock(datetime(2026, 11, 26, 8) - timedelta(seconds=seconds_to_grid))
+        clock = Clock(grid_at - timedelta(seconds=seconds_to_grid))
         scheduler = Scheduler(active, link, log, clock=clock)
         resources.append((scheduler, link, log))
         return scheduler, link, log, clock
@@ -364,3 +369,244 @@ def test_send_now_uses_same_state_gate(rig):
     assert sent["fire_id"] == sent_id
     assert sent["result"] == CONFIRMED
     assert link.start_count == 1
+
+
+def test_establish_timeout_stops_and_discards_late_reply(rig, monkeypatch):
+    scheduler, link, log, clock = rig(seconds_to_grid=8)
+    link.timing = replace(link.timing, request_timeout=0.12)
+    entered, release = Event(), Event()
+    dispatch = link._dispatch
+    establish = link.establish
+    attempts = []
+
+    def blocked_dispatch():
+        entered.set()
+        release.wait()
+        return dispatch()
+
+    def track_establish():
+        future = establish()
+        attempts.append(future)
+        return future
+
+    monkeypatch.setattr(link, "_dispatch", blocked_dispatch)
+    monkeypatch.setattr(link, "establish", track_establish)
+    try:
+        assert scheduler.start()
+        assert entered.wait(timeout=1)
+        before = link.current_request
+        assert before.stage == "establish" and before.started <= monotonic()
+        reason = "確立が応答待ち"
+        cancelled = log.results.get(timeout=2)
+        assert cancelled["reason"] == reason
+        assert not scheduler.active
+        assert scheduler.status == scheduler.link_wait_reason == reason
+        assert not attempts[0].done()
+
+        scheduler.stop()
+        assert not scheduler.start()
+        assert not scheduler.active and scheduler.status == reason
+        assert len(attempts) == 1 and link.current_request == before
+        [error] = events(log, "error")
+        assert (error["stage"], error["reason"]) == ("establish", reason)
+        assert error["elapsed_ms"] > 120
+    finally:
+        release.set()
+
+    assert attempts[0].result(timeout=1) is None
+    wait_for(lambda: scheduler._establish is None)
+    assert link.current_request is None
+    clock.jump(9)
+    fire_id = scheduler.send_now()
+    blocked = log.results.get(timeout=1)
+    assert (blocked["fire_id"], blocked["result"], blocked["reason"]) == (fire_id, SKIPPED, reason)
+    assert len(attempts) == 1 and link.start_count == 0
+    assert not scheduler.active and scheduler.status == reason
+
+    assert scheduler.start()
+    wait_for(lambda: scheduler.status == "待機中")
+    assert len(attempts) == 2
+    assert not scheduler.link_wait_reason
+
+
+def test_running_request_timeout_stops_schedule(rig, monkeypatch):
+    scheduler, link, log, clock = rig(seconds_to_grid=8)
+    link.timing = replace(link.timing, request_timeout=0.12)
+    entered, release = Event(), Event()
+
+    def blocked_module_name(server):
+        entered.set()
+        release.wait()
+        return "Mock WAVE LOGGER"
+
+    monkeypatch.setattr(_MockServer, "GetModuleName", blocked_module_name)
+    try:
+        assert scheduler.start()
+        wait_for(lambda: link.connected and not link.busy)
+        assert link.current_request is None
+        future = scheduler.snapshot()
+        assert future is not None and entered.wait(timeout=1)
+        assert link.current_request.stage == "snapshot"
+
+        reason = "収集ソフトが応答待ち"
+        result = log.results.get(timeout=2)
+        assert result["reason"] == reason and result["result"] == SKIPPED
+        assert not scheduler.active and scheduler.status == reason
+        assert not scheduler.start()
+        assert not future.done()
+        [error] = events(log, "error")
+        assert (error["stage"], error["reason"]) == ("snapshot", reason)
+    finally:
+        release.set()
+
+    assert future.result(timeout=1)["module_name"] == "Mock WAVE LOGGER"
+    assert link.current_request is None
+    clock.jump(9)
+    assert not scheduler.active and scheduler.status == reason
+    scheduler.send_now()
+    assert log.results.get(timeout=1)["reason"] == reason
+    assert link.start_count == 0
+
+
+def test_normal_sta_requests_do_not_trip_watchdog(rig):
+    scheduler, link, log, _ = rig(seconds_to_grid=0.70)
+    link.timing = replace(link.timing, request_timeout=0.20)
+    assert scheduler.start()
+
+    assert log.results.get(timeout=2)["result"] == CONFIRMED
+    assert scheduler.active and scheduler.link_wait_reason is None
+    assert link.current_request is None
+    assert not events(log, "error")
+
+
+def test_short_cron_reconnects_in_next_lead_window_even_during_backoff(rig):
+    scheduler, link, log, _ = rig("disconnect", cron="* * * * * *", seconds_to_grid=0.70)
+    assert scheduler.start()
+    wait_for(lambda: events(log, "link_down"))
+    with scheduler._guard:
+        assert scheduler._next.checking and not link.connected
+        scheduler._retry_at = monotonic() + 60
+
+    first = log.results.get(timeout=2)
+    assert (first["result"], first["reason"]) == (SKIPPED, DISCONNECTED)
+    assert first["call_started_at"] is None
+
+    second = log.results.get(timeout=2)
+    assert second["scheduled_at"] == first["scheduled_at"] + timedelta(seconds=1)
+    assert second["result"] == CONFIRMED
+    assert len(events(log, "establish")) == 2
+    assert link.start_count == 1
+    final = [check for check in events(log, "precheck") if check["fire_id"] == second["fire_id"]][-1]
+    assert final["state"] == 1
+    assert datetime.fromisoformat(final["observed_at"]) <= second["call_started_at"]
+
+
+def test_lead_window_protects_fire_path_while_snapshot_is_in_progress(rig, monkeypatch):
+    scheduler, link, _, clock = rig(seconds_to_grid=8)
+    assert scheduler.start()
+    wait_for(lambda: scheduler.status == "待機中")
+    entered, release = Event(), Event()
+    get_state = _MockServer.GetState
+
+    def blocked_get_state(server):
+        entered.set()
+        release.wait()
+        return get_state(server)
+
+    monkeypatch.setattr(_MockServer, "GetState", blocked_get_state)
+    try:
+        snapshot = scheduler.snapshot()
+        assert snapshot is not None and entered.wait(timeout=1)
+        clock.jump(4)
+        wait_for(lambda: link._protect)
+        with scheduler._guard:
+            assert not scheduler._next.checking
+    finally:
+        release.set()
+
+    value = snapshot.result(timeout=1)
+    assert value["state"] == 1
+    assert "module_name" not in value and "unit_info" not in value
+
+
+def test_file_type_failure_is_reported_in_scheduler_status(rig):
+    scheduler, link, log, _ = rig(settings_file_type=0)
+    assert scheduler.start()
+    result = log.results.get(timeout=2)
+    assert result["reason"] == "確立失敗"
+    wait_for(lambda: scheduler.status.startswith("確立失敗"))
+    assert "establish.GetActiveFileType" in scheduler.status and "GetActiveFileType=0" in scheduler.status
+    assert not scheduler.active and not link.connected
+
+
+def test_establish_backoff_caps_and_resets_after_success(rig, monkeypatch):
+    scheduler, link, _, clock = rig(seconds_to_grid=15)
+    attempts = []
+    problem = Problem("DispatchEx", OPERATION_ERROR, "mock failure")
+
+    def establish():
+        future = Future()
+        attempts.append(future)
+        return future
+
+    monkeypatch.setattr(link, "establish", establish)
+
+    def complete(value):
+        with link._gate:
+            link._ready = value is None
+        attempts[-1].set_result(value)
+
+    with scheduler._guard:
+        now = 100.0
+        wall = clock().replace(tzinfo=None)
+        scheduler._retry_at = now + 60
+        assert scheduler.start()
+        scheduler._service_link(now, wall)
+        assert len(attempts) == 1  # Manual start bypasses backoff.
+        complete(None)
+        scheduler._service_link(now, wall)
+
+        with link._gate:
+            link._ready = False
+        for count, delay in enumerate((1, 2, 4, 8, 16, 32, 60, 60), start=2):
+            scheduler._service_link(now, wall)
+            assert len(attempts) == count
+            complete(problem)
+            scheduler._service_link(now, wall)
+            assert scheduler._retry_at == now + delay
+            scheduler._service_link(now + delay - 0.001, wall)
+            assert len(attempts) == count
+            now = scheduler._retry_at
+
+        scheduler._service_link(now, wall)
+        complete(None)
+        scheduler._service_link(now, wall)
+        assert scheduler._retry_at == 0
+        with link._gate:
+            link._ready = False
+        scheduler._service_link(now, wall)
+        complete(problem)
+        scheduler._service_link(now, wall)
+        assert scheduler._retry_at == now + 1
+        scheduler.stop()
+
+
+@pytest.mark.parametrize("schedule", [
+    {"mode": "interval", "anchor": "99991211 120000", "interval_minutes": 14 * 24 * 60},
+    {"mode": "cron", "cron": "0 0 12 25 12 *"},
+])
+def test_schedule_range_exhaustion_stops_but_collects_last_send(rig, schedule):
+    last_grid = datetime(9999, 12, 25, 12)
+    scheduler, link, log, _ = rig(grid_at=last_grid, **schedule)
+    assert scheduler.start()
+    result = log.results.get(timeout=2)
+    assert result["scheduled_at"] == last_grid.astimezone()
+    assert result["result"] == CONFIRMED and link.start_count == 1
+    assert not scheduler.active and scheduler.next_at is None
+    [error] = events(log, "error")
+    assert error["stage"] == "next_fire_after"
+    assert "日時の範囲外" in error["reason"]
+    assert scheduler.status == error["reason"]
+    assert scheduler._thread.is_alive()
+    assert not scheduler.start()
+    assert scheduler.status == error["reason"]

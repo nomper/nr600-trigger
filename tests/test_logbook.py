@@ -1,5 +1,6 @@
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from src.logbook import Logbook, local_now
 
@@ -45,3 +46,33 @@ def test_retention_only_deletes_managed_old_logs(tmp_path):
     assert {path.name for path in tmp_path.iterdir()} == {
         f"nr-trigger-{today - timedelta(days=days)}.jsonl" for days in (0, 29, -1)
     } | {"unrelated.jsonl", "nr-trigger-2026-99-99.jsonl"}
+
+
+def test_purge_failure_does_not_prevent_other_deletions_or_log_writes(tmp_path, monkeypatch):
+    today = local_now().date()
+    locked = tmp_path / f"nr-trigger-{today - timedelta(days=31)}.jsonl"
+    other = tmp_path / f"nr-trigger-{today - timedelta(days=32)}.jsonl"
+    locked.touch()
+    other.touch()
+    unlink = Path.unlink
+
+    def unlink_unless_locked(path, *args, **kwargs):
+        if path == locked:
+            raise PermissionError("file in use")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink_unless_locked)
+    log = Logbook(tmp_path)
+    try:
+        assert locked.exists()
+        assert not other.exists()
+        assert locked.name in log.errors.get_nowait()
+
+        log.emit("manual", operation="スケジューラ開始")
+        log.flush()
+        assert locked.name in log.errors.get_nowait()
+        [current] = [path for path in tmp_path.glob("*.jsonl") if path != locked]
+        record = json.loads(current.read_text(encoding="utf-8"))
+        assert record["operation"] == "スケジューラ開始"
+    finally:
+        log.close()

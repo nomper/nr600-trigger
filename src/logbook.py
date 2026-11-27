@@ -40,8 +40,12 @@ class Logbook:
                 day = date.fromisoformat(path.stem.removeprefix("nr-trigger-"))
             except ValueError:
                 continue
-            if (today - day).days >= self.retention_days and path.is_file():
-                path.unlink(missing_ok=True)
+            if (today - day).days >= self.retention_days:
+                try:
+                    if path.is_file():
+                        path.unlink(missing_ok=True)
+                except OSError as error:
+                    self.errors.put(f"古いログを削除できません。{path.name} / {error}")
 
     def flush(self) -> None:
         self._queue.join()

@@ -56,7 +56,12 @@ def test_defaults_and_required_fields(tmp_path, config):
     for name in ("mode", "anchor", "interval_minutes", "lead_seconds", "visible", "log_retention_days"):
         del values[name]
     path.write_text(json.dumps(values), encoding="utf-8")
-    assert load_config(path) == config
+    loaded = load_config(path)
+    assert loaded.visible is False
+    assert loaded == config
+    values["visible"] = True
+    path.write_text(json.dumps(values), encoding="utf-8")
+    assert load_config(path).visible is True
     del values["progid"]
     path.write_text(json.dumps(values), encoding="utf-8")
     with pytest.raises(ValueError, match="progid"):
@@ -118,6 +123,22 @@ def test_load_interval_config_without_cron(tmp_path):
     )
     save_config(config, path)
     assert load_config(path) == config
+
+
+@pytest.mark.parametrize(("anchor", "interval"), [
+    ("20251126 090000", 1_000_000_000_000),
+    ("99991231 235900", 1),
+])
+def test_load_interval_config_rejects_overflow(tmp_path, config, anchor, interval):
+    path = tmp_path / "config.json"
+    save_config(replace(config, anchor=anchor, interval_minutes=interval), path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["mode"] = "interval"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="間隔.*大きすぎます") as raised:
+        load_config(path)
+    assert isinstance(raised.value.__cause__, OverflowError)
 
 
 @pytest.mark.parametrize(("key", "value"), [

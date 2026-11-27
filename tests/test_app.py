@@ -5,6 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from src import app
+from src.config import load_config
 
 
 LAUNCH_TEXT = "20261126 090507"
@@ -80,3 +81,50 @@ def test_selecting_interval_fills_only_blank_anchor(make_app, text, expected):
     interval_radio["command"]()
 
     assert window.anchor.get() == expected
+
+
+@pytest.mark.parametrize("saved_anchor", [None, SAVED_ANCHOR, f" {SAVED_ANCHOR} "])
+def test_starting_cron_preserves_saved_anchor(make_app, saved_anchor):
+    window, _, _ = make_app(saved_anchor)
+    if saved_anchor is not None:
+        window.anchor.set("20261129 103000")
+    window.cron.set("15 * * * * *")
+
+    window._start()
+
+    saved = load_config(window.config_path)
+    assert saved.mode == "cron" and saved.cron == "15 * * * * *"
+    assert saved.anchor == saved_anchor
+    window.scheduler.start.assert_called_once_with(saved)
+
+
+def test_starting_interval_saves_anchor_field(make_app):
+    window, _, _ = make_app(SAVED_ANCHOR)
+    window.mode.set("interval")
+    window.anchor.set(" 20261129 103000 ")
+    window.interval.set("7")
+
+    window._start()
+
+    saved = load_config(window.config_path)
+    assert (saved.mode, saved.anchor, saved.interval_minutes) == ("interval", "20261129 103000", 7)
+    window.scheduler.start.assert_called_once_with(saved)
+
+
+@pytest.mark.parametrize("reason", ["確立が応答待ち", "収集ソフトが応答待ち"])
+def test_app_displays_com_wait_reason_even_if_link_reports_ready(make_app, reason):
+    poll = app.App._poll
+    window, _, _ = make_app()
+    window.log = None
+    window.scheduler.link.connected = True
+    window.scheduler.link_wait_reason = reason
+    window.scheduler.status = reason
+    window.scheduler.active = False
+    window.scheduler.next_at = None
+    window._cached_state = "停止（1）"
+    window._message = "別の操作のメッセージ"
+
+    poll(window)
+
+    assert window.connection.get() == window.status.get() == reason
+    assert window.state.get() == "—"

@@ -196,18 +196,21 @@ class App:
                     raise
                 # An inactive interval value must not prevent starting cron.
                 interval_minutes = self.config.interval_minutes
+            anchor = self.config.anchor
+            if mode == "interval":
+                anchor = self.anchor.get().strip() or None
             config = replace(
-                self.config, mode=mode, cron=self.cron.get(), anchor=self.anchor.get().strip() or None,
+                self.config, mode=mode, cron=self.cron.get(), anchor=anchor,
                 interval_minutes=interval_minutes, lead_seconds=int(self.lead.get()),
             )
             if config != self.config:
                 save_config(config, self.config_path)
+                self.config = config
         except (OSError, ValueError) as error:
             self._message = str(error)
             return
         self._message = ""
-        if self.scheduler.start(config):
-            self.config = config
+        self.scheduler.start(config)
 
     def _stop_schedule(self):
         self._message = ""
@@ -246,6 +249,7 @@ class App:
     def _poll(self):
         if self.log:
             self._show_logs()
+        wait_reason = None
         if self.scheduler:
             if self._snapshot is not None and self._snapshot.done():
                 value = self._snapshot.result()
@@ -261,7 +265,11 @@ class App:
                 self._stop = None
                 if isinstance(value, Problem):
                     self._message = f"収集停止失敗。{value.detail}"
-            if self.scheduler.link.connected:
+            wait_reason = self.scheduler.link_wait_reason
+            if wait_reason:
+                self.connection.set(wait_reason)
+                self._cached_state = ""
+            elif self.scheduler.link.connected:
                 self.connection.set("確立済み")
             else:
                 self.connection.set("未確立")
@@ -286,11 +294,12 @@ class App:
         running = ready and self.scheduler.active
         editable = ready and not running
         mode = self.mode.get()
-        self.status.set(
-            "終了処理中" if self._closing else (
-                self._message or (self.scheduler.status if self.scheduler else "停止中")
-            )
-        )
+        status = self.scheduler.status if self.scheduler else "停止中"
+        if self._closing:
+            status = "終了処理中"
+        elif self._message and status != wait_reason:
+            status = self._message
+        self.status.set(status)
         for widget, enabled in (
             (self.start_button, editable), (self.stop_button, running),
             (self.send_button, ready),
@@ -324,7 +333,7 @@ class App:
         except Empty:
             pass
         else:
-            self._message = f"ログの書き込みに失敗しました。{error}"
+            self._message = f"ログ処理でエラーが発生しました。{error}"
 
 
 def main(argv=None):

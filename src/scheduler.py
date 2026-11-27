@@ -18,6 +18,11 @@ FINAL_CHECK_LEAD = 0.100
 PRECHECK_INTERVAL = 0.250
 CLOCK_JUMP = 0.020
 MANUAL_CHECK_TIMEOUT = 1.0
+INITIAL_RETRY_DELAY = 1.0
+MAX_RETRY_DELAY = 60.0
+ESTABLISH_PENDING = "確立が応答待ち"
+REQUEST_PENDING = "収集ソフトが応答待ち"
+SCHEDULE_RANGE_ERROR = "次回発火時刻を計算できません（日時の範囲外）"
 
 
 def _wall(value):
@@ -38,7 +43,8 @@ class _Plan:
     ticket: FireTicket
     due: float
     grid: datetime | None = None
-    checking: bool = False
+    checking: bool = False  # The STA has accepted a precheck for this fire path.
+    lead_retry_attempted: bool = False
     check: Future | None = None
     latest: Reading | None = None
     last_check: float = float("-inf")
@@ -58,8 +64,11 @@ class Scheduler:
         self._manual = None
         self._flight = None
         self._establish = None
+        self._establish_started = None
         self._starting = False
         self._retry_at = 0.0
+        self._retry_delay = INITIAL_RETRY_DELAY
+        self.link_wait_reason = None
         self._done = set()
         self._active = False
         self._closing = False
@@ -83,11 +92,20 @@ class Scheduler:
         with self._guard:
             if self._active or self._closing or self._closed:
                 return False
+            if self.link_wait_reason:
+                if (self._establish is not None and not self._establish.done()) or self.link.busy:
+                    self.status = self.link_wait_reason
+                    return False
+                # An explicit start can revalidate the link once the STA is free.
+                self._establish = self._establish_started = None
             if config is not None:
                 self.config = config
             wall, now = _wall(self._clock()), monotonic()
             self._last_clock = (wall, now)
             self._next = self._next_after(wall, wall, now)
+            if self._next is None:
+                return False
+            self.link_wait_reason = None
             self._active = True
             self._starting = True
             self.status = "確立中"
@@ -107,7 +125,7 @@ class Scheduler:
             self.log.emit("manual", operation="スケジューラ停止")
             self._stop("スケジューラ停止による取消")
 
-    def _stop(self, reason):
+    def _stop(self, reason, *, cancel_flight=True):
         self._active = False
         self._starting = False
         for plan in (self._next, self._manual):
@@ -115,10 +133,10 @@ class Scheduler:
                 remember_grid = plan.grid is not None and plan.grid <= _wall(self._clock())
                 self._record(plan, FireResult(SKIPPED, reason), remember_grid=remember_grid)
         self._next = self._manual = None
-        if self._flight:
+        if cancel_flight and self._flight:
             self._flight[0].ticket.cancel()
         self._sync_protection()
-        self.status = "停止中"
+        self.status = self.link_wait_reason or "停止中"
         self._wake.set()
 
     def send_now(self):
@@ -128,6 +146,8 @@ class Scheduler:
             wall = _wall(self._clock())
             if self._closing or self._closed:
                 self._record(plan, FireResult(SKIPPED, "終了処理中"))
+            elif self.link_wait_reason:
+                self._record(plan, FireResult(SKIPPED, self.link_wait_reason))
             elif self._manual or self._flight or self._lead_started(wall) or self.link.busy:
                 self._record(plan, FireResult(SKIPPED, "別の処理が進行中"))
             elif not self.link.connected:
@@ -154,7 +174,7 @@ class Scheduler:
 
     def snapshot(self):
         with self._guard:
-            if self._closing or self._lead_started(_wall(self._clock())):
+            if self._closing or self.link_wait_reason or self._lead_started(_wall(self._clock())):
                 return None
             return self.link.snapshot()
 
@@ -180,11 +200,18 @@ class Scheduler:
         return closed
 
     def _next_after(self, base, wall, now):
-        grid = self.config.next_fire_after(base)
-        in_flight = self._flight[0].grid if self._flight else None
-        while grid in self._done or grid == in_flight:
-            grid = self.config.next_fire_after(grid)
-        ticket = FireTicket(_local_grid(grid, self._clock()))
+        try:
+            grid = self.config.next_fire_after(base)
+            in_flight = self._flight[0].grid if self._flight else None
+            while grid in self._done or grid == in_flight:
+                grid = self.config.next_fire_after(grid)
+            ticket = FireTicket(_local_grid(grid, self._clock()))
+        except (OverflowError, ValueError) as error:
+            # Calendar arithmetic can also report an out-of-range year as ValueError.
+            self.log.emit("error", stage="next_fire_after", reason=SCHEDULE_RANGE_ERROR, detail=str(error))
+            self._stop(SCHEDULE_RANGE_ERROR, cancel_flight=False)
+            self.status = SCHEDULE_RANGE_ERROR
+            return None
         return _Plan(ticket, now + (grid - wall).total_seconds(), grid)
 
     def _lead_started(self, wall):
@@ -194,7 +221,7 @@ class Scheduler:
 
     def _sync_protection(self):
         self.link.protect_fire_path(bool(
-            self._manual or self._flight or (self._next and self._next.checking)
+            self._manual or self._flight or (self._next and self._lead_started(_wall(self._clock())))
         ))
 
     def _run(self):
@@ -211,7 +238,7 @@ class Scheduler:
         self._collect_flight()
         if self._closing:
             return 0.020
-        self._service_link(now)
+        self._service_link(now, wall)
         if self._manual:
             self._tick_manual(now)
         if not self._active:
@@ -222,6 +249,8 @@ class Scheduler:
         self._last_clock = (wall, now)
         if drift < -CLOCK_JUMP:
             plan = self._next_after(wall, wall, now)
+            if plan is None:
+                return 0.020
             same_grid = (
                 plan.grid == self._next.grid
                 and plan.ticket.scheduled_at.utcoffset() == self._next.ticket.scheduled_at.utcoffset()
@@ -229,7 +258,7 @@ class Scheduler:
             if same_grid:
                 self._next.due = plan.due
                 self._next.final_requested = False
-                self._next.checking = self._lead_started(wall)
+                self._next.checking = self._next.checking and self._lead_started(wall)
             else:
                 self._next.ticket.cancel()
                 self._next = plan
@@ -259,14 +288,35 @@ class Scheduler:
                     return min(0.020, lead_remaining - FINAL_CHECK_LEAD)
                 return min(0.100, lead_remaining - self.config.lead_seconds)
 
+            self._next = None  # This grid has already been recorded or dispatched.
             self._next = self._next_after(plan.grid, wall, now)
+            if self._next is None:
+                return 0.020
             self._sync_protection()
         return 0.001
 
-    def _service_link(self, now):
-        if self._establish is not None and self._establish.done():
-            problem = self._establish.result()
-            self._establish = None
+    def _service_link(self, now, wall):
+        timeout = self.link.timing.request_timeout
+        if self._establish is not None:
+            if not self._establish.done():
+                if not self.link_wait_reason and now - self._establish_started > timeout:
+                    request = self.link.current_request
+                    self._stop_for_link_wait(
+                        ESTABLISH_PENDING, request.stage if request else "establish",
+                        now - self._establish_started,
+                    )
+                return
+            future = self._establish
+            self._establish = self._establish_started = None
+            if self.link_wait_reason:  # Discard a reply that arrived after the timeout.
+                return
+            problem = future.result()
+            if problem is None:
+                self._retry_delay = INITIAL_RETRY_DELAY
+                self._retry_at = 0.0
+            else:
+                self._retry_at = now + self._retry_delay
+                self._retry_delay = min(self._retry_delay * 2, MAX_RETRY_DELAY)
             if self._starting:
                 self._starting = False
                 if problem is not None:
@@ -274,15 +324,30 @@ class Scheduler:
                     self.status = f"確立失敗（{problem.stage}） {problem.detail}"
                     return
                 self.status = "待機中"
-        if self._establish is not None or not self._active or self._flight or self._manual:
+        if self._active or self._manual:
+            request = self.link.current_request
+            if request is not None and now - request.started > timeout:
+                self._stop_for_link_wait(REQUEST_PENDING, request.stage, now - request.started)
+                return
+        if not self._active or self._flight or self._manual:
             return
+        # Each grid can try once in its lead window even during backoff.
+        in_lead = self._lead_started(wall)
+        lead_retry = in_lead and not self._next.lead_retry_attempted
         # A lost connection stays down for the rest of the current fire path.
         if self._starting or (
-            not self.link.connected and not self._next.checking and now >= self._retry_at
+            not self.link.connected and not self._next.checking and (lead_retry or now >= self._retry_at)
         ):
             self._establish = self.link.establish()
             if self._establish is not None:
-                self._retry_at = now + 1.0
+                self._establish_started = now
+                if in_lead:
+                    self._next.lead_retry_attempted = True
+
+    def _stop_for_link_wait(self, reason, stage, elapsed):
+        self.link_wait_reason = reason
+        self.log.emit("error", reason=reason, stage=stage, elapsed_ms=elapsed * 1000)
+        self._stop(reason)
 
     def _read_check(self, plan):
         if plan.check is None or not plan.check.done():
@@ -297,11 +362,8 @@ class Scheduler:
                 plan.problem = reading.problem
 
     def _tick_precheck(self, plan, now, remaining):
-        if not plan.checking:
-            plan.checking = True
-            self._sync_protection()
-        if not self._starting:
-            self.status = "事前確認中"
+        # Diagnostics yield during the lead window even while the STA is busy.
+        self.link.protect_fire_path(True)
         self._read_check(plan)
         if plan.check is not None or plan.problem or plan.final_requested or not self.link.connected:
             return
@@ -311,6 +373,9 @@ class Scheduler:
             if plan.check is not None:
                 plan.last_check = now
                 plan.final_requested = final
+                plan.checking = True
+                if not self._starting:
+                    self.status = "事前確認中"
 
     def _dispatch_grid(self, plan):
         self._read_check(plan)
@@ -367,10 +432,10 @@ class Scheduler:
         if self._flight and self._flight[1].done():
             plan, result = self._flight
             self._flight = None
-            self._record(plan, result.result())
+            self._record(plan, result.result(), update_status=self.status != SCHEDULE_RANGE_ERROR)
             self._sync_protection()
 
-    def _record(self, plan, outcome, *, remember_grid=True):
+    def _record(self, plan, outcome, *, remember_grid=True, update_status=True):
         plan.ticket.cancel()
         if remember_grid and plan.grid is not None:
             if plan.grid in self._done:
@@ -382,4 +447,5 @@ class Scheduler:
             call_started_at=plan.ticket.started_at,
             **(outcome.problem.fields() if outcome.problem else {}),
         )
-        self.status = outcome.result
+        if update_status and not self.link_wait_reason:
+            self.status = outcome.result

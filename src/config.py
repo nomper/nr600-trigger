@@ -126,7 +126,7 @@ class Config:
     anchor: str | None = None
     interval_minutes: int | None = None
     lead_seconds: int = 5
-    visible: bool = True
+    visible: bool = False
     log_retention_days: int = 30
     mock: MockConfig | None = None
 
@@ -159,9 +159,13 @@ class Config:
             except (CroniterError, ValueError, OverflowError) as error:
                 raise ValueError(f"cron が不正です: {error}") from error
         else:
-            parse_anchor(self.anchor)
+            anchor = parse_anchor(self.anchor)
             if type(self.interval_minutes) is not int or self.interval_minutes < 1:
                 raise ValueError("interval_minutes（間隔）は 1 以上の整数を指定してください")
+            try:
+                interval_next(anchor, self.interval_minutes, max(anchor, datetime.now()))
+            except OverflowError as error:
+                raise ValueError("interval_minutes（間隔）が大きすぎます") from error
 
     def next_fire_after(self, base: datetime) -> datetime:
         if self.mode == "cron":

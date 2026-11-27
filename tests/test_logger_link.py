@@ -147,8 +147,10 @@ def test_precheck_file_type_read_error(config, tmp_path, monkeypatch, hresult, r
         log.close()
 
 
-@pytest.mark.parametrize("hresult", [None, -2147417848], ids=["type-zero", "read-error"])
-def test_establish_without_file_type_baseline(config, tmp_path, monkeypatch, hresult):
+@pytest.mark.parametrize(("value", "hresult"), [
+    (None, None), (0, None), (4, None), (None, -2147417848),
+], ids=["type-none", "type-zero", "type-out-of-range", "read-error"])
+def test_establish_without_file_type_baseline(config, tmp_path, monkeypatch, value, hresult):
     log = Logbook(tmp_path)
     link = MockLink(config, log)
     reads = []
@@ -159,20 +161,21 @@ def test_establish_without_file_type_baseline(config, tmp_path, monkeypatch, hre
     def read_file_type(server):
         reads.append(server.link.file_type)
         if hresult is None:
-            return 0
+            return value
         error = ReadError("GetActiveFileType failed")
         error.hresult = hresult
         raise error
 
     try:
         monkeypatch.setattr(_MockServer, "GetActiveFileType", read_file_type)
-        assert link.establish().result(timeout=1) is None
-        link.file_type = 0
-        ticket = FireTicket(local_now())
-        reading = link.precheck(ticket, monotonic() + 1).result(timeout=1)
-        assert reading.state == 1 and reading.problem is None
+        problem = link.establish().result(timeout=1)
+        assert isinstance(problem, Problem)
+        assert problem.stage == "establish.GetActiveFileType"
+        assert problem.reason == (STATE_ERROR if hresult is None else DISCONNECTED)
+        assert problem.hresult == hresult
         assert reads == [2]
-        assert link.connected and link.reopen_count == 0
+        assert not link.connected
+        assert link.precheck(FireTicket(local_now()), monotonic() + 1) is None
     finally:
         assert link.close()
         log.close()
@@ -183,9 +186,11 @@ def test_establish_without_file_type_baseline(config, tmp_path, monkeypatch, hre
         for line in path.read_text(encoding="utf-8").splitlines()
     ]
     [established] = [event for event in entries if event["kind"] == "establish"]
-    assert established["success"] and established["file_type_baseline"] is None
-    if hresult is None:
-        assert established["api_returns"]["GetActiveFileType"] == 0
+    assert not established["success"] and established["file_type_baseline"] is None
+    assert established["failed_stage"] == problem.stage
+    assert established["detail"] == problem.detail
+    if value is not None:
+        assert established["api_returns"]["GetActiveFileType"] == value
     else:
         error = established["api_returns"]["GetActiveFileType_error"]
         assert error["stage"] == "establish.GetActiveFileType"

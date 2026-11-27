@@ -96,6 +96,13 @@ class Timing:
     observe_timeout: float = 3.0
     observe_interval: float = 0.25
     close_timeout: float = 5.0
+    request_timeout: float = 30.0
+
+
+@dataclass(frozen=True)
+class StaRequest:
+    stage: str
+    started: float
 
 
 @dataclass
@@ -124,6 +131,7 @@ class _Worker:
         self._queue = Queue()
         self._lock = Lock()
         self._pending = False
+        self._current_request = None
         self._closing = False
         self._done = Event()
         self.problem = None
@@ -137,6 +145,11 @@ class _Worker:
     def busy(self):
         with self._lock:
             return self._pending
+
+    @property
+    def current_request(self) -> StaRequest | None:
+        with self._lock:
+            return self._current_request
 
     @property
     def terminated(self):
@@ -160,12 +173,16 @@ class _Worker:
             stage, action, future = self._queue.get_nowait()
         except Empty:
             return
+        with self._lock:
+            self._current_request = StaRequest(stage, monotonic())
         try:
             result = action()
         except Exception as error:
             result = _exception(stage, error)
-        with self._lock:
-            self._pending = False
+        finally:
+            with self._lock:
+                self._current_request = None
+                self._pending = False
         future.set_result(result)
 
     def _finish(self, problem):
@@ -307,6 +324,12 @@ class LoggerLink:
         with self._gate:
             return self._firing or (self._worker is not None and self._worker.busy)
 
+    @property
+    def current_request(self) -> StaRequest | None:
+        """Describe the executing STA request, if any."""
+        with self._gate:
+            return self._worker.current_request if self._worker is not None else None
+
     def protect_fire_path(self, active):
         with self._gate:
             self._protect = active
@@ -426,18 +449,25 @@ class LoggerLink:
             if values[stage] != 0:
                 problem = Problem(stage, OPERATION_ERROR, "OpenFile が失敗しました")
                 return problem
-            file_type = self._read_file_type("establish.GetActiveFileType")
+            stage = "establish.GetActiveFileType"
+            file_type = self._read_file_type(stage)
             if isinstance(file_type, Problem):
                 values["GetActiveFileType_error"] = file_type.fields()
-            else:
-                values["GetActiveFileType"] = file_type
+                problem = file_type
+                if problem.reason == DISCONNECTED:
+                    self._link_down(problem)
+                return problem
+            values["GetActiveFileType"] = file_type
+            if file_type not in (1, 2, 3):
+                problem = Problem(stage, STATE_ERROR, f"GetActiveFileType={file_type}")
+                return problem
             stage = "GetState"
             reading = self._read_state("establish.GetState")
             values[stage] = reading.state
             if not can_start(reading.state):
                 problem = reading.problem or Problem(stage, OPERATION_ERROR, f"GetState={reading.state}")
                 return problem
-            self._file_type_baseline = values.get("GetActiveFileType") or None
+            self._file_type_baseline = file_type
             self._link_up()
             return None
         except Exception as error:
