@@ -15,7 +15,7 @@ from threading import Thread
 from tkinter import filedialog, messagebox, ttk
 
 from . import single_instance
-from .config import Config, load_config, save_config
+from .config import LOGGER_MODELS, Config, load_config, save_config
 from .logbook import Logbook, local_now
 from .logger_link import LoggerLink, Problem, STATE_NAMES
 from .mock_link import MockLink
@@ -230,7 +230,7 @@ class App:
         def browse():
             path = filedialog.askopenfilename(
                 parent=dialog,
-                filetypes=(("収録条件ファイル", ("*.ucf", "*.xcf")), ("すべてのファイル", "*")),
+                filetypes=(("収録条件ファイル", ("*.ucf", "*.xcf", "*.ycf")), ("すべてのファイル", "*")),
             )
             if path:
                 settings_file.set(path)
@@ -240,7 +240,7 @@ class App:
             ("progid", progid_entry),
             ("設定ファイル", ttk.Entry(frame, textvariable=settings_file)),
             ("ロガー機種", ttk.Combobox(
-                frame, textvariable=logger_model, values=("NR-500", "NR-600"), state="readonly", width=10,
+                frame, textvariable=logger_model, values=LOGGER_MODELS, state="readonly", width=10,
             )),
             ("ユニット ID", ttk.Spinbox(frame, textvariable=unit_id, from_=0, to=3, width=4)),
             ("リンクモード", ttk.Combobox(

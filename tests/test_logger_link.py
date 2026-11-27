@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from threading import Event
 from time import monotonic
 
@@ -214,6 +215,73 @@ def test_reconnect_reads_new_file_type_baseline(config, tmp_path):
         assert reading.state == 1 and reading.problem is None
         assert link.file_type == 3
         assert link.reopen_count == 0
+    finally:
+        assert link.close()
+        log.close()
+
+
+@pytest.mark.parametrize(("model", "file_type", "baseline"), [
+    ("NR-500", 1, 1),
+    ("NR-X100", 2, 2),
+    ("NR-X100", 3, None),
+])
+def test_establish_x_file_type_baseline(config, tmp_path, model, file_type, baseline):
+    config = replace(
+        config, progid="WaveLoggerXDemo.Application", logger_model=model,
+        settings_file="condition.ycf" if model == "NR-X100" else "condition.xcf",
+    )
+    log = Logbook(tmp_path)
+    link = MockLink(config, log, settings_file_type=file_type)
+
+    try:
+        result = link.establish().result(timeout=1)
+        if baseline is None:
+            assert isinstance(result, Problem)
+            assert result.stage == "establish.GetActiveFileType"
+            assert result.reason == STATE_ERROR
+            assert result.detail == "GetActiveFileType=3"
+            assert not link.connected
+        else:
+            assert result is None
+            assert link.connected
+    finally:
+        assert link.close()
+        log.close()
+
+    [established] = [
+        event
+        for path in tmp_path.glob("*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if (event := json.loads(line))["kind"] == "establish"
+    ]
+    assert established["success"] is (baseline is not None)
+    assert established["file_type_baseline"] == baseline
+
+
+@pytest.mark.parametrize(("progid", "model", "args", "unit_info"), [
+    ("WaveLoggerXDemo.Application", "NR-X100", (0, 0), 198),
+    ("WaveLoggerPro2Demo.Application", "NR-600", (0,), 194),
+], ids=["X", "PRO"])
+def test_snapshot_get_unit_info(config, tmp_path, monkeypatch, progid, model, args, unit_info):
+    config = replace(config, progid=progid, logger_model=model)
+    log = Logbook(tmp_path)
+    link = MockLink(config, log)
+    calls = []
+    get_unit_info = _MockServer.GetUnitInfo
+
+    def record_get_unit_info(server, *call_args):
+        calls.append(call_args)
+        return get_unit_info(server, *call_args)
+
+    monkeypatch.setattr(_MockServer, "GetUnitInfo", record_get_unit_info)
+
+    try:
+        assert link.establish().result(timeout=1) is None
+        snapshot = link.snapshot().result(timeout=1)
+
+        assert calls == [args]
+        assert snapshot["unit_info"] == unit_info
+        assert "diagnostic_errors" not in snapshot
     finally:
         assert link.close()
         log.close()

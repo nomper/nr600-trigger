@@ -18,8 +18,22 @@ MOCK_SCENARIOS = frozenset({
     "disconnect_on_start", "disconnect_after_start", "busy",
     "start_failure", "error_stop",
 })
+LOGGER_MODELS = ("NR-500", "NR-600", "NR-X100")
 
 
+_SOFTWARE_BY_PROGID = {
+    "WaveLoggerPro2.Application": "PRO",
+    "WaveLoggerPro2Demo.Application": "PRO",
+    "WaveLoggerX.Application": "X",
+    "WaveLoggerXDemo.Application": "X",
+    "WaveLogger2.Application": "無印",
+    "WaveLogger2Demo.Application": "無印",
+}
+_MODELS_BY_SOFTWARE = {
+    "PRO": ("NR-500", "NR-600"),
+    "X": ("NR-500", "NR-X100"),
+    "無印": ("NR-500",),
+}
 _CRON_RANGES = ((0, 59), (0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
 _CRON_ITEM = re.compile(r"(\*|[0-9]+(?:-[0-9]+)?)(?:/([0-9]+))?")
 
@@ -138,8 +152,8 @@ class Config:
             value = getattr(self, field)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{field} は空でない文字列を指定してください")
-        if self.logger_model not in ("NR-500", "NR-600"):
-            raise ValueError("logger_model は NR-500 または NR-600 を指定してください")
+        if self.logger_model not in LOGGER_MODELS:
+            raise ValueError(f"logger_model は {'、'.join(LOGGER_MODELS)} のいずれかを指定してください")
         if type(self.unit_id) is not int or not 0 <= self.unit_id <= 3:
             raise ValueError("unit_id は 0〜3 の整数を指定してください")
         if type(self.lead_seconds) is not int or not 3 <= self.lead_seconds <= 5:
@@ -154,6 +168,19 @@ class Config:
             raise ValueError("mode は cron または interval を指定してください")
         if self.link_mode not in ("full", "simple"):
             raise ValueError("link_mode は full または simple を指定してください")
+        software = self.software
+        if software is not None:
+            models = _MODELS_BY_SOFTWARE[software]
+            if self.logger_model not in models:
+                raise ValueError(
+                    f"WAVE LOGGER {software} では logger_model に {self.logger_model} を指定できません。"
+                    f"対応機種は {'、'.join(models)} です"
+                )
+            if software == "無印" and self.link_mode == "full":
+                raise ValueError(
+                    "無印 WAVE LOGGER には GetActiveFileType がないため link_mode に full を指定できません。"
+                    "simple を指定してください"
+                )
         if self.mode == "cron":
             if not isinstance(self.cron, str) or not self.cron.strip():
                 raise ValueError("cron は空でない文字列を指定してください")
@@ -176,8 +203,12 @@ class Config:
         return interval_next(parse_anchor(self.anchor), self.interval_minutes, base)
 
     @property
+    def software(self) -> str | None:
+        return _SOFTWARE_BY_PROGID.get(self.progid)
+
+    @property
     def identifier(self) -> int:
-        return self.unit_id + (4 if self.logger_model == "NR-600" else 0)
+        return self.unit_id + (4 if self.logger_model in ("NR-600", "NR-X100") else 0)
 
     @property
     def expected_identifier(self) -> int:
@@ -190,8 +221,12 @@ class Config:
         than the value passed to SetIdentifier.  The trial cannot
         emulate an NR-500, so NR-500 follows the manual (the physical
         ID itself) until the product unit is checked at acceptance.
+
+        NR-X100 assumes 8 + unit_id by analogy with the NR-600 trial
+        result.  This is unverified in WAVE LOGGER X and requires
+        acceptance testing on actual hardware and the X trial server.
         """
-        return self.unit_id + (8 if self.logger_model == "NR-600" else 0)
+        return self.unit_id + (8 if self.logger_model in ("NR-600", "NR-X100") else 0)
 
 
 def load_config(path: Path | str) -> Config:

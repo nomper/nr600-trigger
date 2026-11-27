@@ -114,8 +114,12 @@ class _MockServer:
     def GetModuleName(self):
         return "Mock WAVE LOGGER"
 
-    def GetUnitInfo(self, unit):
-        return 194 if self.link.config.logger_model == "NR-600" else 193
+    def GetUnitInfo(self, unit, x_unit=None):
+        # In the two-argument X call, the first argument is the group number.
+        model = self.link.config.logger_model
+        if model == "NR-X100":
+            return 198
+        return 194 if model == "NR-600" else 193
 
     def Stop(self):
         self.link.state = 1

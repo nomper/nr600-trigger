@@ -7,16 +7,61 @@ import pytest
 from src.config import MockConfig, cron_schedule, interval_next, load_config, parse_anchor, save_config
 
 
-@pytest.mark.parametrize(("model", "offset"), [("NR-500", 0), ("NR-600", 4)])
-def test_identifier(config, model, offset):
+@pytest.mark.parametrize(("model", "progid", "offset"), [
+    ("NR-500", "WaveLoggerPro2Demo.Application", 0),
+    ("NR-600", "WaveLoggerPro2Demo.Application", 4),
+    ("NR-X100", "WaveLoggerXDemo.Application", 4),
+])
+def test_identifier(config, model, progid, offset):
     for unit_id in range(4):
-        assert replace(config, logger_model=model, unit_id=unit_id).identifier == offset + unit_id
+        updated = replace(config, progid=progid, logger_model=model, unit_id=unit_id)
+        assert updated.identifier == offset + unit_id
 
 
-@pytest.mark.parametrize(("model", "offset"), [("NR-500", 0), ("NR-600", 8)])
-def test_expected_identifier(config, model, offset):
+@pytest.mark.parametrize(("model", "progid", "offset"), [
+    ("NR-500", "WaveLoggerPro2Demo.Application", 0),
+    ("NR-600", "WaveLoggerPro2Demo.Application", 8),
+    ("NR-X100", "WaveLoggerXDemo.Application", 8),
+])
+def test_expected_identifier(config, model, progid, offset):
     for unit_id in range(4):
-        assert replace(config, logger_model=model, unit_id=unit_id).expected_identifier == offset + unit_id
+        updated = replace(config, progid=progid, logger_model=model, unit_id=unit_id)
+        assert updated.expected_identifier == offset + unit_id
+
+
+@pytest.mark.parametrize("edition", ["", "Demo"], ids=["product", "demo"])
+@pytest.mark.parametrize(("progid_base", "software", "model", "link_mode"), [
+    ("WaveLoggerPro2", "PRO", "NR-600", "full"),
+    ("WaveLoggerPro2", "PRO", "NR-600", "simple"),
+    ("WaveLoggerPro2", "PRO", "NR-500", "full"),
+    ("WaveLoggerPro2", "PRO", "NR-500", "simple"),
+    ("WaveLoggerX", "X", "NR-X100", "full"),
+    ("WaveLoggerX", "X", "NR-X100", "simple"),
+    ("WaveLoggerX", "X", "NR-500", "full"),
+    ("WaveLoggerX", "X", "NR-500", "simple"),
+    ("WaveLogger2", "無印", "NR-500", "simple"),
+])
+def test_supported_software_combinations(config, edition, progid_base, software, model, link_mode):
+    updated = replace(
+        config, progid=f"{progid_base}{edition}.Application", logger_model=model, link_mode=link_mode,
+    )
+    assert updated.software == software
+
+
+@pytest.mark.parametrize(("progid", "model", "link_mode", "message"), [
+    ("WaveLoggerPro2.Application", "NR-X100", "full", r"WAVE LOGGER PRO .*NR-X100.*対応機種は NR-500、NR-600"),
+    ("WaveLoggerX.Application", "NR-600", "full", r"WAVE LOGGER X .*NR-600.*対応機種は NR-500、NR-X100"),
+    ("WaveLogger2.Application", "NR-600", "simple", r"WAVE LOGGER 無印 .*NR-600.*対応機種は NR-500"),
+    ("WaveLogger2Demo.Application", "NR-500", "full", r"無印 WAVE LOGGER.*GetActiveFileType.*full.*simple"),
+])
+def test_unsupported_software_combinations(config, progid, model, link_mode, message):
+    with pytest.raises(ValueError, match=message):
+        replace(config, progid=progid, logger_model=model, link_mode=link_mode)
+
+
+def test_unknown_progid_skips_software_combination_validation(config):
+    updated = replace(config, progid="CustomLogger.Application", logger_model="NR-X100", link_mode="full")
+    assert updated.software is None
 
 
 @pytest.mark.parametrize(("key", "value"), [

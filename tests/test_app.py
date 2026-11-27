@@ -24,7 +24,7 @@ def test_initial_anchor(saved_anchor, expected):
 @pytest.fixture
 def connection_inputs():
     return dict(
-        progid="WaveLogger.Application", settings_file=r"C:\条件\測定.xcf",
+        progid="WaveLogger2.Application", settings_file=r"C:\条件\測定.xcf",
         logger_model="NR-500", unit_id="3", link_mode="simple", visible=True,
     )
 
@@ -39,7 +39,7 @@ def test_connection_config_converts_dialog_inputs(config, connection_inputs):
 @pytest.mark.parametrize(("field", "value", "message"), [
     ("progid", "  ", "progid は空でない文字列を指定してください"),
     ("settings_file", "", "settings_file は空でない文字列を指定してください"),
-    ("logger_model", "NR-700", "logger_model は NR-500 または NR-600 を指定してください"),
+    ("logger_model", "NR-700", "logger_model は NR-500、NR-600、NR-X100 のいずれかを指定してください"),
     ("unit_id", "4", "unit_id は 0〜3 の整数を指定してください"),
     ("unit_id", "abc", "unit_id は 0〜3 の整数を指定してください"),
     ("link_mode", "unknown", "link_mode は full または simple を指定してください"),
@@ -95,6 +95,32 @@ def make_app(monkeypatch, config, tmp_path):
         return window, cron_radio.kwargs, interval_radio.kwargs
 
     return create
+
+
+def test_connection_dialog_offers_nr_x100_and_ycf(make_app, monkeypatch):
+    window, _, _ = make_app()
+    window.scheduler.active = False
+    dialog = Mock()
+    settings_path = r"C:\条件\測定.ycf"
+    askopenfilename = Mock(return_value=settings_path)
+    monkeypatch.setattr(app.tk, "Toplevel", Mock(return_value=dialog))
+    monkeypatch.setattr(app.tk, "StringVar", lambda master, value: FakeStringVar(value))
+    monkeypatch.setattr(app.tk, "BooleanVar", lambda master, value: FakeStringVar(value))
+    monkeypatch.setattr(app.filedialog, "askopenfilename", askopenfilename)
+    app.ttk.Button.reset_mock()
+
+    window._edit_connection()
+
+    model_combo, _ = app.ttk.Combobox.call_args_list
+    assert model_combo.kwargs["values"] == ("NR-500", "NR-600", "NR-X100")
+    browse = next(call.kwargs["command"] for call in app.ttk.Button.call_args_list if call.kwargs["text"] == "参照")
+    browse()
+    askopenfilename.assert_called_once_with(
+        parent=dialog,
+        filetypes=(("収録条件ファイル", ("*.ucf", "*.xcf", "*.ycf")), ("すべてのファイル", "*")),
+    )
+    settings_entry = app.ttk.Entry.call_args_list[-1]
+    assert settings_entry.kwargs["textvariable"].get() == settings_path
 
 
 @pytest.mark.parametrize(("saved_anchor", "expected"), [

@@ -472,7 +472,8 @@ class LoggerLink:
                     self._link_down(problem)
                 return problem
             values["GetActiveFileType"] = file_type
-            if file_type not in (1, 2, 3):
+            valid_file_types = (1, 2) if self.config.software == "X" else (1, 2, 3)
+            if file_type not in valid_file_types:
                 problem = Problem(stage, STATE_ERROR, f"GetActiveFileType={file_type}")
                 return problem
             stage = "GetState"
@@ -790,8 +791,10 @@ class LoggerLink:
             data = reading.fields()
             if reading.problem:
                 return data
+            unit_info_args = (0, 0) if self.config.software == "X" else (0,)
             for key, method, args in (
-                ("module_name", "GetModuleName", ()), ("unit_info", "GetUnitInfo", (0,)),
+                ("module_name", "GetModuleName", ()),
+                ("unit_info", "GetUnitInfo", unit_info_args),
             ):
                 with self._gate:
                     if self._protect or self._closing:
