@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from src import app
-from src.config import load_config
+from src.config import MockConfig, load_config
 
 
 LAUNCH_TEXT = "20261126 090507"
@@ -19,6 +19,48 @@ SAVED_ANCHOR = "2026/11/25 08:04:06"
 ])
 def test_initial_anchor(saved_anchor, expected):
     assert app.initial_anchor(saved_anchor, LAUNCH_TEXT) == expected
+
+
+@pytest.fixture
+def connection_inputs():
+    return dict(
+        progid="WaveLogger.Application", settings_file=r"C:\条件\測定.xcf",
+        logger_model="NR-500", unit_id="3", link_mode="simple", visible=True,
+    )
+
+
+def test_connection_config_converts_dialog_inputs(config, connection_inputs):
+    updated = app.connection_config(config, **connection_inputs)
+
+    assert updated == replace(config, **dict(connection_inputs, unit_id=3))
+    assert config.unit_id == 0
+
+
+@pytest.mark.parametrize(("field", "value", "message"), [
+    ("progid", "  ", "progid は空でない文字列を指定してください"),
+    ("settings_file", "", "settings_file は空でない文字列を指定してください"),
+    ("logger_model", "NR-700", "logger_model は NR-500 または NR-600 を指定してください"),
+    ("unit_id", "4", "unit_id は 0〜3 の整数を指定してください"),
+    ("unit_id", "abc", "unit_id は 0〜3 の整数を指定してください"),
+    ("link_mode", "unknown", "link_mode は full または simple を指定してください"),
+])
+def test_connection_config_reports_validation_error(config, connection_inputs, field, value, message):
+    connection_inputs[field] = value
+
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        app.connection_config(config, **connection_inputs)
+
+
+def test_connection_config_preserves_interval_schedule_and_other_settings(config, connection_inputs):
+    current = replace(
+        config, mode="interval", anchor=SAVED_ANCHOR, interval_minutes=7, lead_seconds=3,
+        log_retention_days=17, mock=MockConfig(scenario="delay", delay_seconds=0.1),
+    )
+
+    updated = app.connection_config(current, **connection_inputs)
+
+    assert updated == replace(current, **dict(connection_inputs, unit_id=3))
+    assert updated.mock is current.mock
 
 
 class FakeStringVar:

@@ -12,10 +12,10 @@ from dataclasses import replace
 from pathlib import Path, PureWindowsPath
 from queue import Empty, Queue
 from threading import Thread
-from tkinter import ttk
+from tkinter import filedialog, messagebox, ttk
 
 from . import single_instance
-from .config import load_config, save_config
+from .config import Config, load_config, save_config
 from .logbook import Logbook, local_now
 from .logger_link import LoggerLink, Problem, STATE_NAMES
 from .mock_link import MockLink
@@ -27,6 +27,20 @@ BUILD = "step1"
 
 def initial_anchor(saved_anchor: str | None, launch_text: str) -> str:
     return saved_anchor or launch_text
+
+
+def connection_config(
+    current: Config, *, progid: str, settings_file: str, logger_model: str,
+    unit_id: str, link_mode: str, visible: bool,
+) -> Config:
+    try:
+        parsed_unit_id = int(unit_id)
+    except ValueError as error:
+        raise ValueError("unit_id は 0〜3 の整数を指定してください") from error
+    return replace(
+        current, progid=progid, settings_file=settings_file, logger_model=logger_model,
+        unit_id=parsed_unit_id, link_mode=link_mode, visible=visible,
+    )
 
 
 def _software_version(progid):
@@ -72,6 +86,7 @@ class App:
         self._snapshot = self._stop = None
         self._close_results = Queue()
         self._closing = False
+        self._connection_dialog = None
         self._cached_state = ""
         self._message = ""
         self.connection = tk.StringVar(value="未確立")
@@ -88,30 +103,38 @@ class App:
         try:
             self.config = load_config(config_path)
             self.log = Logbook(log_directory, self.config.log_retention_days)
-            link = MockLink(self.config, self.log) if self.config.mock else LoggerLink(self.config, self.log)
-            self.scheduler = Scheduler(self.config, link, self.log)
+            self.scheduler = self._new_scheduler(self.config)
             self.mode.set(self.config.mode)
             self.cron.set(self.config.cron)
             self.anchor.set(initial_anchor(self.config.anchor, self._launch_text))
             self.interval.set("" if self.config.interval_minutes is None else str(self.config.interval_minutes))
             self.lead.set(str(self.config.lead_seconds))
-            settings = PureWindowsPath(self.config.settings_file).name
-            self.details.set(f"{settings}  /  {self.config.logger_model} ID {self.config.unit_id}")
-            interval_fields = {}
-            if self.config.mode == "interval":
-                interval_fields = {"anchor": self.config.anchor, "interval_minutes": self.config.interval_minutes}
-            self.log.emit(
-                "config", app_build=BUILD, windows_version=platform.win32_ver()[1] or None,
-                software_version="mock" if self.config.mock else _software_version(self.config.progid),
-                logger_model=self.config.logger_model, progid=self.config.progid,
-                mode=self.config.mode, cron=self.config.cron,
-                timezone=local_now().tzname(), timezone_names=time.tzname,
-                lead_seconds=self.config.lead_seconds, **interval_fields,
-            )
+            self._show_config()
         except (OSError, ValueError) as error:
             self._message = f"設定を読み込めません。{error}"
         self._poll()
         self._poll_snapshot()
+
+    def _new_scheduler(self, config):
+        link_class = MockLink if config.mock else LoggerLink
+        return Scheduler(config, link_class(config, self.log), self.log)
+
+    def _show_config(self):
+        config = self.config
+        settings = PureWindowsPath(config.settings_file).name
+        self.details.set(f"{settings}  /  {config.logger_model} ID {config.unit_id}")
+        interval_fields = {}
+        if config.mode == "interval":
+            interval_fields = {"anchor": config.anchor, "interval_minutes": config.interval_minutes}
+        self.log.emit(
+            "config", app_build=BUILD, windows_version=platform.win32_ver()[1] or None,
+            software_version="mock" if config.mock else _software_version(config.progid),
+            logger_model=config.logger_model, progid=config.progid,
+            link_mode=config.link_mode, settings_file=config.settings_file,
+            mode=config.mode, cron=config.cron,
+            timezone=local_now().tzname(), timezone_names=time.tzname,
+            lead_seconds=config.lead_seconds, **interval_fields,
+        )
 
     def _build(self):
         self.root.title("NR-Trigger")
@@ -160,6 +183,7 @@ class App:
         self.stop_button = self._button(controls, "スケジューラ停止", self._stop_schedule)
         self.send_button = self._button(controls, "今すぐ送信", self._fire_now)
         self.collect_button = self._button(controls, "収集停止", self._stop_collect)
+        self.connection_button = self._button(controls, "接続設定", self._edit_connection)
         self.close_button = self._button(controls, "終了", self._close)
 
         listing = ttk.Frame(frame)
@@ -180,6 +204,121 @@ class App:
         button = ttk.Button(parent, text=text, command=command)
         button.pack(side="left", padx=(0, 5))
         return button
+
+    def _edit_connection(self):
+        if self.scheduler is None or self._closing or self._connection_dialog is not None:
+            return
+        title = "接続設定"
+        if self.scheduler.active:
+            messagebox.showinfo(title, "スケジューラを停止してから編集してください", parent=self.root)
+            return
+
+        current = self.config
+        dialog = self._connection_dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+        progid = tk.StringVar(dialog, value=current.progid)
+        settings_file = tk.StringVar(dialog, value=current.settings_file)
+        logger_model = tk.StringVar(dialog, value=current.logger_model)
+        unit_id = tk.StringVar(dialog, value=str(current.unit_id))
+        link_mode = tk.StringVar(dialog, value=current.link_mode)
+        visible = tk.BooleanVar(dialog, value=current.visible)
+
+        def browse():
+            path = filedialog.askopenfilename(
+                parent=dialog,
+                filetypes=(("収録条件ファイル", ("*.ucf", "*.xcf")), ("すべてのファイル", "*")),
+            )
+            if path:
+                settings_file.set(path)
+
+        progid_entry = ttk.Entry(frame, textvariable=progid, width=42)
+        fields = (
+            ("progid", progid_entry),
+            ("設定ファイル", ttk.Entry(frame, textvariable=settings_file)),
+            ("ロガー機種", ttk.Combobox(
+                frame, textvariable=logger_model, values=("NR-500", "NR-600"), state="readonly", width=10,
+            )),
+            ("ユニット ID", ttk.Spinbox(frame, textvariable=unit_id, from_=0, to=3, width=4)),
+            ("リンクモード", ttk.Combobox(
+                frame, textvariable=link_mode, values=("full", "simple"), state="readonly", width=10,
+            )),
+        )
+        for row, (label, widget) in enumerate(fields):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
+            widget.grid(row=row, column=1, sticky="ew" if row < 2 else "w")
+        ttk.Button(frame, text="参照", command=browse).grid(row=1, column=2, padx=(6, 0))
+        ttk.Checkbutton(frame, text="収集ソフトを表示", variable=visible).grid(row=5, column=1, sticky="w")
+
+        saving = False
+        close_results = Queue()
+
+        def cancel(event=None):
+            if not saving:
+                self._connection_dialog = None
+                dialog.destroy()
+
+        def set_saving(value):
+            nonlocal saving
+            saving = value
+            for widget in frame.winfo_children():
+                widget.state(("disabled",) if saving else ("!disabled",))
+
+        def finish_save(config):
+            try:
+                closed = close_results.get_nowait()
+            except Empty:
+                dialog.after(50, finish_save, config)
+                return
+            set_saving(False)
+            if not closed:
+                messagebox.showerror(
+                    title, "接続を閉じられません。収集ソフトの応答または収集・読み出しの完了を待ってください。",
+                    parent=dialog,
+                )
+                return
+
+            self._snapshot = self._stop = None
+            self._cached_state = ""
+            try:
+                save_config(config, self.config_path)
+            except OSError as error:
+                self.scheduler = self._new_scheduler(self.config)
+                messagebox.showerror(title, f"設定を保存できません。{error}", parent=dialog)
+                return
+
+            self.scheduler = self._new_scheduler(config)
+            self.config = config
+            self._message = ""
+            self._show_config()
+            cancel()
+
+        def save():
+            try:
+                config = connection_config(
+                    self.config, progid=progid.get(), settings_file=settings_file.get(),
+                    logger_model=logger_model.get(), unit_id=unit_id.get(),
+                    link_mode=link_mode.get(), visible=visible.get(),
+                )
+            except ValueError as error:
+                messagebox.showerror(title, str(error), parent=dialog)
+                return
+
+            set_saving(True)
+            scheduler = self.scheduler
+            Thread(target=lambda: close_results.put(scheduler.close()), name="connection-close", daemon=True).start()
+            finish_save(config)
+
+        ttk.Button(frame, text="保存", command=save).grid(row=6, column=1, sticky="e", pady=(8, 0))
+        ttk.Button(frame, text="キャンセル", command=cancel).grid(row=6, column=2, padx=(6, 0), pady=(8, 0))
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.bind("<Escape>", cancel)
+        dialog.wait_visibility()
+        dialog.grab_set()
+        progid_entry.focus_set()
 
     def _fill_anchor(self):
         if not self.anchor.get().strip():
@@ -228,7 +367,7 @@ class App:
                 self._message = "収集停止を依頼できません。未接続または処理中です"
 
     def _close(self):
-        if self._closing:
+        if self._closing or self._connection_dialog is not None:
             return
         if self.scheduler is None:
             self.root.destroy()
@@ -304,6 +443,7 @@ class App:
             (self.start_button, editable), (self.stop_button, running),
             (self.send_button, ready),
             (self.collect_button, ready and self._stop is None and self.scheduler.link.connected),
+            (self.connection_button, ready),
             (self.close_button, not self._closing),
             (self.cron_radio, editable), (self.interval_radio, editable), (self.lead_entry, editable),
             (self.cron_entry, editable and mode == "cron"),
