@@ -1,12 +1,16 @@
 import json
 from dataclasses import replace
+from datetime import timedelta
 from threading import Event
 from time import monotonic
 
 import pytest
 
+from src import logger_link
 from src.logbook import Logbook, local_now
-from src.logger_link import DISCONNECTED, FAILED, OPERATION_ERROR, SKIPPED, STATE_ERROR, FireTicket, Problem
+from src.logger_link import (
+    DISCONNECTED, FAILED, OPERATION_ERROR, SKIPPED, STATE_ERROR, FireTicket, Problem, Reading, can_start,
+)
 from src.mock_link import MockLink, _MockServer
 
 
@@ -119,6 +123,72 @@ def test_precheck_rejects_successful_open_without_expected_file_type(config, tmp
         log.close()
 
 
+@pytest.mark.parametrize(("before", "after"), [(1, 4), (4, 1), (1, -1)])
+def test_precheck_rereads_state_after_reopen(config, tmp_path, monkeypatch, before, after):
+    log = Logbook(tmp_path)
+    link = MockLink(config, log)
+    open_file = _MockServer.OpenFile
+
+    def reopen(server, path):
+        retval = open_file(server, path)
+        server.link.state = after
+        return retval
+
+    try:
+        assert link.establish().result(timeout=1) is None
+        monkeypatch.setattr(_MockServer, "OpenFile", reopen)
+        link.state, link.file_type = before, 0
+        observed_before = local_now()
+        observed_after = observed_before + timedelta(seconds=1)
+        times = iter((observed_before, observed_after))
+        with monkeypatch.context() as patch:
+            patch.setattr(logger_link, "local_now", lambda: next(times))
+            result = link.precheck(FireTicket(observed_before), monotonic() + 1).result(timeout=1)
+
+        if after < 0:
+            assert isinstance(result, Problem)
+            assert result.stage == "precheck.GetState" and result.reason == STATE_ERROR
+        else:
+            assert isinstance(result, Reading) and result.problem is None
+            assert result.state == after and can_start(result.state) is (after == 1)
+            assert result.observed_at == observed_after
+        assert link.reopen_count == 1
+    finally:
+        link.state = 1
+        assert link.close()
+        log.close()
+
+    [entry] = [
+        event for path in tmp_path.glob("*.jsonl") for line in path.read_text(encoding="utf-8").splitlines()
+        if (event := json.loads(line))["kind"] == "precheck"
+    ]
+    assert entry["reopen_success"] is True
+    assert (entry["state"], entry["state_after_reopen"]) == (before, after)
+    assert entry["observed_at_after_reopen"] == observed_after.isoformat(timespec="milliseconds")
+
+
+@pytest.mark.parametrize("stage", ["SetIdentifier", "OpenFile", "precheck.OpenFile"])
+def test_file_and_identifier_operations_reject_non_integer_return(config, tmp_path, monkeypatch, stage):
+    log = Logbook(tmp_path)
+    link = MockLink(config, log)
+    try:
+        if stage == "precheck.OpenFile":
+            assert link.establish().result(timeout=1) is None
+            link.file_type = 0
+        monkeypatch.setattr(_MockServer, stage.rsplit(".", 1)[-1], lambda *args: False)
+
+        if stage == "precheck.OpenFile":
+            result = link.precheck(FireTicket(local_now()), monotonic() + 1).result(timeout=1)
+        else:
+            result = link.establish().result(timeout=1)
+        assert isinstance(result, Problem)
+        assert (result.stage, result.reason) == (stage, OPERATION_ERROR)
+        assert "False" in result.detail and "bool" in result.detail
+    finally:
+        assert link.close()
+        log.close()
+
+
 @pytest.mark.parametrize(("hresult", "reason"), [(None, STATE_ERROR), (-2147417848, DISCONNECTED)])
 def test_precheck_file_type_read_error(config, tmp_path, monkeypatch, hresult, reason):
     log = Logbook(tmp_path)
@@ -220,14 +290,63 @@ def test_reconnect_reads_new_file_type_baseline(config, tmp_path):
         log.close()
 
 
-@pytest.mark.parametrize(("model", "file_type", "baseline"), [
-    ("NR-500", 1, 1),
-    ("NR-X100", 2, 2),
-    ("NR-X100", 3, None),
+@pytest.mark.parametrize("previous_state", [-1, RuntimeError("GetState failed"), 4, 1])
+def test_establish_recreates_server_only_when_previous_state_read_fails(config, tmp_path, monkeypatch, previous_state):
+    log = Logbook(tmp_path)
+    link = MockLink(config, log)
+    servers = []
+    previous_reads = [previous_state]
+    recreation_needed = isinstance(previous_state, Exception) or previous_state < 0
+
+    class PreviousServer(_MockServer):
+        def GetState(self):
+            if self.established and previous_reads:
+                value = previous_reads.pop()
+                if isinstance(value, Exception):
+                    raise value
+                return value
+            return super().GetState()
+
+    def dispatch():
+        server = _MockServer(link) if servers else PreviousServer(link)
+        servers.append(server)
+        return server
+
+    try:
+        monkeypatch.setattr(link, "_dispatch", dispatch)
+        assert link.establish().result(timeout=1) is None
+
+        result = link.establish().result(timeout=1)
+
+        if previous_state == 4:
+            assert isinstance(result, Problem) and result.detail == "GetState=4"
+        else:
+            assert result is None
+        assert len(servers) == (2 if recreation_needed else 1)
+        assert link.connected and link.quit_count == 0
+    finally:
+        assert link.close()
+        log.close()
+
+    entries = [
+        event for path in tmp_path.glob("*.jsonl") for line in path.read_text(encoding="utf-8").splitlines()
+        if (event := json.loads(line))["kind"] == "establish"
+    ]
+    returns = entries[-1]["api_returns"]
+    assert returns.get("recreate_after_state_error", False) is recreation_needed
+    if recreation_needed:
+        assert returns["previous_GetState_error"]["error_kind"] == STATE_ERROR
+
+
+@pytest.mark.parametrize(("progid", "model", "file_type", "baseline"), [
+    ("WaveLoggerXDemo.Application", "NR-500", 1, 1),
+    ("WaveLoggerXDemo.Application", "NR-X100", 2, 2),
+    ("WaveLoggerXDemo.Application", "NR-X100", 3, None),
+    ("  waveloggerxdemo.application  ", "NR-X100", 3, None),
 ])
-def test_establish_x_file_type_baseline(config, tmp_path, model, file_type, baseline):
+def test_establish_x_file_type_baseline(config, tmp_path, progid, model, file_type, baseline):
     config = replace(
-        config, progid="WaveLoggerXDemo.Application", logger_model=model,
+        config, progid=progid, logger_model=model,
         settings_file="condition.ycf" if model == "NR-X100" else "condition.xcf",
     )
     log = Logbook(tmp_path)
@@ -326,6 +445,24 @@ def test_file_closed_after_precheck_is_start_failure(config, tmp_path):
         assert result.problem.detail == "Start=1"
         assert link.start_count == 1
         assert link.reopen_count == 0
+    finally:
+        assert link.close()
+        log.close()
+
+
+@pytest.mark.parametrize("retval", [False, 0.0, None])
+def test_start_rejects_non_integer_return(config, tmp_path, monkeypatch, retval):
+    log = Logbook(tmp_path)
+    link = MockLink(config, log)
+    try:
+        assert link.establish().result(timeout=1) is None
+        monkeypatch.setattr(_MockServer, "Start", lambda server: retval)
+
+        result = link.fire(FireTicket(local_now()), monotonic() + 1).result(timeout=1)
+
+        assert result.result == FAILED
+        assert result.problem.stage == "Start"
+        assert repr(retval) in result.problem.detail and type(retval).__name__ in result.problem.detail
     finally:
         assert link.close()
         log.close()

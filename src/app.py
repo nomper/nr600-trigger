@@ -8,21 +8,24 @@ import re
 import sys
 import time
 import tkinter as tk
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path, PureWindowsPath
 from queue import Empty, Queue
 from threading import Thread
 from tkinter import filedialog, messagebox, ttk
 
 from . import single_instance
-from .config import LOGGER_MODELS, Config, load_config, save_config
+from .config import (
+    KNOWN_PROGIDS, LOGGER_MODELS, Config, load_config, save_config, software_for_progid,
+)
 from .logbook import Logbook, local_now
 from .logger_link import LoggerLink, Problem, STATE_NAMES
 from .mock_link import MockLink
 from .scheduler import Scheduler
 
 
-BUILD = "step1"
+VERSION = "1.3.1"
+CONNECTION_CLOSE_GRACE = 2.0
 
 
 def initial_anchor(saved_anchor: str | None, launch_text: str) -> str:
@@ -47,18 +50,19 @@ def _software_version(progid):
     if sys.platform != "win32":
         return None
 
-    import winreg
-
     try:
+        import winreg
         from win32api import GetFileVersionInfo
-    except ImportError:
+
+        views = (0, winreg.KEY_WOW64_32KEY, winreg.KEY_WOW64_64KEY)
+    except Exception:
         return None
 
     def registry_value(key, view):
         with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, key, 0, winreg.KEY_READ | view) as handle:
             return winreg.QueryValueEx(handle, "")[0]
 
-    for view in (0, winreg.KEY_WOW64_32KEY, winreg.KEY_WOW64_64KEY):
+    for view in views:
         try:
             clsid = registry_value(f"{progid}\\CLSID", view)
             command = registry_value(f"CLSID\\{clsid}\\LocalServer32", view)
@@ -68,13 +72,16 @@ def _software_version(progid):
                 version = GetFileVersionInfo(path, "\\")
                 high, low = version["FileVersionMS"], version["FileVersionLS"]
                 return ".".join(str(part) for part in (high >> 16, high & 65535, low >> 16, low & 65535))
-        except OSError:
+        except Exception:
             continue
-        except Exception as error:
-            # pywintypes.error is a distinct exception for missing version resources.
-            if not hasattr(error, "winerror"):
-                raise
     return None
+
+
+def _close_for_connection_save(scheduler, results):
+    try:
+        results.put(scheduler.close())
+    except Exception as error:
+        results.put(error)
 
 
 class App:
@@ -87,6 +94,8 @@ class App:
         self._close_results = Queue()
         self._closing = False
         self._connection_dialog = None
+        self._connection_close_pending = None
+        self._pending_start = None
         self._cached_state = ""
         self._message = ""
         self.connection = tk.StringVar(value="未確立")
@@ -127,8 +136,9 @@ class App:
         if config.mode == "interval":
             interval_fields = {"anchor": config.anchor, "interval_minutes": config.interval_minutes}
         self.log.emit(
-            "config", app_build=BUILD, windows_version=platform.win32_ver()[1] or None,
+            "config", app_build=VERSION, windows_version=platform.win32_ver()[1] or None,
             software_version="mock" if config.mock else _software_version(config.progid),
+            mock=asdict(config.mock) if config.mock else None,
             logger_model=config.logger_model, progid=config.progid,
             link_mode=config.link_mode, settings_file=config.settings_file,
             mode=config.mode, cron=config.cron,
@@ -145,7 +155,7 @@ class App:
         frame.columnconfigure(1, weight=1)
         frame.rowconfigure(7, weight=1)
         for row, (label, value) in enumerate((
-            ("収集ソフト", self.connection), ("収集条件・機器", self.details),
+            ("収集ソフト", self.connection), ("設定上の収録条件・機器", self.details),
             ("計測状態", self.state), ("次回発火", self.next_time), ("動作状態", self.status),
         )):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=3)
@@ -235,7 +245,16 @@ class App:
             if path:
                 settings_file.set(path)
 
-        progid_entry = ttk.Entry(frame, textvariable=progid, width=42)
+        software = tk.StringVar(dialog, value="")
+
+        def update_software(*_):
+            software.set(software_for_progid(progid.get()) or "判定不能")
+
+        progid.trace_add("write", update_software)
+        update_software()
+        progid_entry = ttk.Combobox(
+            frame, textvariable=progid, values=KNOWN_PROGIDS, state="normal", width=42,
+        )
         fields = (
             ("progid", progid_entry),
             ("設定ファイル", ttk.Entry(frame, textvariable=settings_file)),
@@ -250,11 +269,11 @@ class App:
         for row, (label, widget) in enumerate(fields):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
             widget.grid(row=row, column=1, sticky="ew" if row < 2 else "w")
+        ttk.Label(frame, textvariable=software).grid(row=0, column=2, sticky="w", padx=(6, 0))
         ttk.Button(frame, text="参照", command=browse).grid(row=1, column=2, padx=(6, 0))
         ttk.Checkbutton(frame, text="収集ソフトを表示", variable=visible).grid(row=5, column=1, sticky="w")
 
         saving = False
-        close_results = Queue()
 
         def cancel(event=None):
             if not saving:
@@ -267,13 +286,21 @@ class App:
             for widget in frame.winfo_children():
                 widget.state(("disabled",) if saving else ("!disabled",))
 
-        def finish_save(config):
+        def finish_save(config, close_results, deadline):
+            if time.monotonic() >= deadline:
+                self._connection_close_pending = close_results
+                set_saving(False)
+                messagebox.showerror(title, "接続を閉じる処理がタイムアウトしました。", parent=dialog)
+                return
             try:
                 closed = close_results.get_nowait()
             except Empty:
-                dialog.after(50, finish_save, config)
+                dialog.after(50, finish_save, config, close_results, deadline)
                 return
             set_saving(False)
+            if isinstance(closed, Exception):
+                messagebox.showerror(title, f"接続を閉じられません。{closed}", parent=dialog)
+                return
             if not closed:
                 messagebox.showerror(
                     title, "接続を閉じられません。収集ソフトの応答または収集・読み出しの完了を待ってください。",
@@ -297,6 +324,9 @@ class App:
             cancel()
 
         def save():
+            if self._connection_close_pending is not None:
+                messagebox.showerror(title, "接続を閉じる処理の応答を待っています。", parent=dialog)
+                return
             try:
                 config = connection_config(
                     self.config, progid=progid.get(), settings_file=settings_file.get(),
@@ -307,10 +337,20 @@ class App:
                 messagebox.showerror(title, str(error), parent=dialog)
                 return
 
-            set_saving(True)
             scheduler = self.scheduler
-            Thread(target=lambda: close_results.put(scheduler.close()), name="connection-close", daemon=True).start()
-            finish_save(config)
+            close_results = Queue()
+            deadline = time.monotonic() + scheduler.link.timing.close_timeout + CONNECTION_CLOSE_GRACE
+            set_saving(True)
+            try:
+                Thread(
+                    target=_close_for_connection_save, args=(scheduler, close_results),
+                    name="connection-close", daemon=True,
+                ).start()
+            except RuntimeError as error:
+                set_saving(False)
+                messagebox.showerror(title, f"接続を閉じられません。{error}", parent=dialog)
+                return
+            finish_save(config, close_results, deadline)
 
         ttk.Button(frame, text="保存", command=save).grid(row=6, column=1, sticky="e", pady=(8, 0))
         ttk.Button(frame, text="キャンセル", command=cancel).grid(row=6, column=2, padx=(6, 0), pady=(8, 0))
@@ -325,6 +365,8 @@ class App:
             self.anchor.set(self._launch_text)
 
     def _start(self):
+        if self._pending_start is not None:
+            return
         try:
             mode = self.mode.get()
             interval = self.interval.get().strip()
@@ -342,14 +384,29 @@ class App:
                 self.config, mode=mode, cron=self.cron.get(), anchor=anchor,
                 interval_minutes=interval_minutes, lead_seconds=int(self.lead.get()),
             )
-            if config != self.config:
-                save_config(config, self.config_path)
-                self.config = config
-        except (OSError, ValueError) as error:
+        except ValueError as error:
             self._message = str(error)
             return
         self._message = ""
-        self.scheduler.start(config)
+        if self.scheduler.start(config) and config != self.config:
+            self._pending_start = config
+            self._save_started_config()
+
+    def _save_started_config(self):
+        if self._pending_start is None:
+            return
+        outcome = self.scheduler._start_outcome
+        if outcome is None:
+            return
+        config, self._pending_start = self._pending_start, None
+        if outcome:
+            try:
+                save_config(config, self.config_path)
+            except OSError as error:
+                self.scheduler.stop()
+                self._message = f"設定を保存できません。{error}"
+            else:
+                self.config = config
 
     def _stop_schedule(self):
         self._message = ""
@@ -388,8 +445,25 @@ class App:
     def _poll(self):
         if self.log:
             self._show_logs()
+        if self._connection_close_pending is not None and not self._closing:
+            try:
+                closed = self._connection_close_pending.get_nowait()
+            except Empty:
+                pass
+            else:
+                self._connection_close_pending = None
+                if closed is True:
+                    # The timed-out save was abandoned, so restore the original connection settings.
+                    self._snapshot = self._stop = None
+                    self._cached_state = ""
+                    self.scheduler = self._new_scheduler(self.config)
+                elif isinstance(closed, Exception):
+                    self._message = f"接続を閉じられません。{closed}"
         wait_reason = None
+        connected = False
+        connection_label = "未確立"
         if self.scheduler:
+            self._save_started_config()
             if self._snapshot is not None and self._snapshot.done():
                 value = self._snapshot.result()
                 self._snapshot = None
@@ -405,17 +479,20 @@ class App:
                 if isinstance(value, Problem):
                     self._message = f"収集停止失敗。{value.detail}"
             wait_reason = self.scheduler.link_wait_reason
+            connected = self.scheduler.link.connected
             if wait_reason:
-                self.connection.set(wait_reason)
+                connection_label = wait_reason
                 self._cached_state = ""
-            elif self.scheduler.link.connected:
-                self.connection.set("確立済み")
+            elif connected:
+                connection_label = "確立済み"
             else:
-                self.connection.set("未確立")
                 self._cached_state = ""
             self.state.set(self._cached_state or "—")
             next_at = self.scheduler.next_at
             self.next_time.set(next_at.isoformat(sep=" ", timespec="seconds") if next_at else "—")
+        if self.config and self.config.mock:
+            connection_label += "（模擬運転）"
+        self.connection.set(connection_label)
 
         try:
             closed = self._close_results.get_nowait()
@@ -427,11 +504,11 @@ class App:
                 self.root.destroy()
                 return
             self._closing = False
-            self._message = "終了保留。応答または収集・読み出しの完了を待っています"
+            self._message = "終了保留。応答または収集・読み出しが終わったら、もう一度「終了」を押してください"
 
         ready = self.scheduler is not None and not self._closing
         running = ready and self.scheduler.active
-        editable = ready and not running
+        editable = ready and not running and self._pending_start is None
         mode = self.mode.get()
         status = self.scheduler.status if self.scheduler else "停止中"
         if self._closing:
@@ -441,8 +518,8 @@ class App:
         self.status.set(status)
         for widget, enabled in (
             (self.start_button, editable), (self.stop_button, running),
-            (self.send_button, ready),
-            (self.collect_button, ready and self._stop is None and self.scheduler.link.connected),
+            (self.send_button, ready and connected),
+            (self.collect_button, ready and self._stop is None and connected),
             (self.connection_button, ready),
             (self.close_button, not self._closing),
             (self.cron_radio, editable), (self.interval_radio, editable), (self.lead_entry, editable),

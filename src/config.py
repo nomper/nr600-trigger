@@ -29,6 +29,8 @@ _SOFTWARE_BY_PROGID = {
     "WaveLogger2.Application": "無印",
     "WaveLogger2Demo.Application": "無印",
 }
+KNOWN_PROGIDS = tuple(_SOFTWARE_BY_PROGID)
+_CANONICAL_PROGIDS = {progid.casefold(): progid for progid in KNOWN_PROGIDS}
 _MODELS_BY_SOFTWARE = {
     "PRO": ("NR-500", "NR-600"),
     "X": ("NR-500", "NR-X100"),
@@ -36,6 +38,11 @@ _MODELS_BY_SOFTWARE = {
 }
 _CRON_RANGES = ((0, 59), (0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
 _CRON_ITEM = re.compile(r"(\*|[0-9]+(?:-[0-9]+)?)(?:/([0-9]+))?")
+
+
+def software_for_progid(progid: str) -> str | None:
+    canonical = _CANONICAL_PROGIDS.get(progid.strip().casefold())
+    return _SOFTWARE_BY_PROGID.get(canonical)
 
 
 def _cron_values(field, low, high):
@@ -50,6 +57,8 @@ def _cron_values(field, low, high):
             first, last = low, high
         else:
             left, _, right = span.partition("-")
+            if stride is not None and not right:
+                raise ValueError(f"フィールド {field!r} の刻みは * または範囲に指定してください")
             first, last = int(left), int(right or left)
         if not (step > 0 and low <= first <= last <= high):
             raise ValueError(f"フィールド {field!r} の範囲または刻みが不正です")
@@ -204,7 +213,7 @@ class Config:
 
     @property
     def software(self) -> str | None:
-        return _SOFTWARE_BY_PROGID.get(self.progid)
+        return software_for_progid(self.progid)
 
     @property
     def identifier(self) -> int:

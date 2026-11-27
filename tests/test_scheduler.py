@@ -10,10 +10,11 @@ import pytest
 from src.config import MockConfig
 from src.logbook import Logbook
 from src.logger_link import (
-    CONFIRMED, DISCONNECTED, FAILED, OPERATION_ERROR, SENT, SKIPPED, UNCONFIRMED, UNKNOWN, Problem, Timing,
+    CONFIRMED, DISCONNECTED, FAILED, OPERATION_ERROR, SENT, SKIPPED, UNCONFIRMED, UNKNOWN,
+    FireResult, FireTicket, Problem, Timing,
 )
 from src.mock_link import MockLink, _MockServer
-from src.scheduler import Scheduler
+from src.scheduler import Scheduler, _Plan
 
 
 class Clock:
@@ -269,6 +270,24 @@ def test_clock_rewind_does_not_fire_same_grid_twice(rig):
     assert [entry["fire_id"] for entry in events(log, "result")] == [first["fire_id"]]
 
 
+def test_old_processed_grids_are_pruned_and_stay_retired_after_rewind(rig):
+    scheduler, _, _, clock = rig(cron="0 0 * * * *")
+    first = clock().replace(minute=0, second=0, microsecond=0, tzinfo=None)
+    now = monotonic()
+    with scheduler._guard:
+        for hour in range(72):
+            grid = first + timedelta(hours=hour)
+            scheduler._prune_done(grid)
+            plan = _Plan(FireTicket(grid.astimezone()), now, grid)
+            scheduler._record(plan, FireResult(SKIPPED, "テスト"))
+            assert len(scheduler._done) <= 24
+        assert len(scheduler._done) == 24 and first not in scheduler._done
+
+        rewind = first - timedelta(seconds=1)
+        next_plan = scheduler._next_after(rewind, rewind, now)
+        assert next_plan.grid == first + timedelta(hours=72)
+
+
 def test_missed_grids_are_logged_after_clock_jump(rig):
     scheduler, link, log, clock = rig(cron="* * * * * *")
     assert scheduler.start()
@@ -476,6 +495,57 @@ def test_running_request_timeout_stops_schedule(rig, monkeypatch):
     scheduler.send_now()
     assert log.results.get(timeout=1)["reason"] == reason
     assert link.start_count == 0
+
+
+@pytest.mark.parametrize(("operation", "method", "stage"), [
+    ("snapshot", "GetModuleName", "snapshot"), ("stop_collect", "Stop", "Stop"),
+])
+def test_idle_request_timeout_reports_request_and_elapsed_once(rig, monkeypatch, operation, method, stage):
+    scheduler, link, log, _ = rig(seconds_to_grid=8)
+    link.timing = replace(link.timing, request_timeout=0.12)
+    entered, release = Event(), Event()
+    original = getattr(_MockServer, method)
+
+    def blocked(server):
+        entered.set()
+        release.wait()
+        return original(server)
+
+    try:
+        assert scheduler.start()
+        wait_for(lambda: scheduler.status == "待機中")
+        scheduler.stop()
+        monkeypatch.setattr(_MockServer, method, blocked)
+        assert link.connected and not scheduler.active
+        future = getattr(scheduler, operation)()
+        assert future is not None and entered.wait(timeout=1)
+        wait_for(lambda: scheduler.link_wait_reason and scheduler.status == scheduler.link_wait_reason)
+
+        reason = "収集ソフトが応答待ち"
+        assert not scheduler.active and not future.done()
+        assert scheduler.status == scheduler.link_wait_reason
+        assert scheduler.status.startswith(f"{reason}（{stage}・")
+        assert scheduler.status.endswith("秒経過）")
+        sleep(0.15)  # Let the idle watchdog tick again with the same request still running.
+        [error] = events(log, "error")
+        assert (error["stage"], error["reason"]) == (stage, reason)
+        assert error["elapsed_ms"] > 120
+    finally:
+        release.set()
+    future.result(timeout=1)
+
+
+def test_scheduler_close_exception_allows_retry(rig, monkeypatch):
+    scheduler, link, _, _ = rig()
+
+    def fail_close():
+        raise RuntimeError("close failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(link, "close", fail_close)
+        with pytest.raises(RuntimeError, match="close failed"):
+            scheduler.close()
+    assert scheduler.close()
 
 
 def test_normal_sta_requests_do_not_trip_watchdog(rig):

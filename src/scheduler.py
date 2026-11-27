@@ -20,6 +20,8 @@ CLOCK_JUMP = 0.020
 MANUAL_CHECK_TIMEOUT = 1.0
 INITIAL_RETRY_DELAY = 1.0
 MAX_RETRY_DELAY = 60.0
+DONE_RETENTION = timedelta(hours=24)
+DONE_PRUNE_INTERVAL = timedelta(minutes=1)
 ESTABLISH_PENDING = "確立が応答待ち"
 REQUEST_PENDING = "収集ソフトが応答待ち"
 SCHEDULE_RANGE_ERROR = "次回発火時刻を計算できません（日時の範囲外）"
@@ -69,7 +71,10 @@ class Scheduler:
         self._retry_at = 0.0
         self._retry_delay = INITIAL_RETRY_DELAY
         self.link_wait_reason = None
+        self._timed_out_request = None
         self._done = set()
+        self._done_cutoff = datetime.min
+        self._done_through = datetime.min
         self._active = False
         self._closing = False
         self._closed = False
@@ -88,6 +93,11 @@ class Scheduler:
         with self._guard:
             return self._active
 
+    @property
+    def _start_outcome(self):
+        with self._guard:
+            return None if self._starting else self._active
+
     def start(self, config: Config | None = None):
         with self._guard:
             if self._active or self._closing or self._closed:
@@ -98,12 +108,14 @@ class Scheduler:
                     return False
                 # An explicit start can revalidate the link once the STA is free.
                 self._establish = self._establish_started = None
+            previous_config = self.config
             if config is not None:
                 self.config = config
             wall, now = _wall(self._clock()), monotonic()
             self._last_clock = (wall, now)
             self._next = self._next_after(wall, wall, now)
             if self._next is None:
+                self.config = previous_config
                 return False
             self.link_wait_reason = None
             self._active = True
@@ -185,23 +197,28 @@ class Scheduler:
             if self._closing:
                 return False
             self._closing = True
-            self._stop("終了による取消")
-        closed = self.link.close()
-        with self._guard:
-            self._collect_flight()
-            self._closed = closed
-            self._closing = False
-            self._wake.set()
-            if not closed:
-                self.status = "終了保留"
-                self.log.emit("manual", operation="終了保留", reason="STA の応答または収集・読み出しの完了待ち")
+        try:
+            with self._guard:
+                self._stop("終了による取消")
+            closed = self.link.close()
+            with self._guard:
+                self._collect_flight()
+                self._closed = closed
+                if not closed:
+                    self.status = "終了保留"
+                    self.log.emit("manual", operation="終了保留", reason="STA の応答または収集・読み出しの完了待ち")
+        finally:
+            with self._guard:
+                self._closing = False
+                self._wake.set()
         if closed:
             self._thread.join()
         return closed
 
     def _next_after(self, base, wall, now):
         try:
-            grid = self.config.next_fire_after(base)
+            # Slots at or before the watermark stay retired even after a clock rewind.
+            grid = self.config.next_fire_after(max(base, self._done_through))
             in_flight = self._flight[0].grid if self._flight else None
             while grid in self._done or grid == in_flight:
                 grid = self.config.next_fire_after(grid)
@@ -235,6 +252,7 @@ class Scheduler:
 
     def _tick(self):
         wall, now = _wall(self._clock()), monotonic()
+        self._prune_done(wall)
         self._collect_flight()
         if self._closing:
             return 0.020
@@ -324,11 +342,15 @@ class Scheduler:
                     self.status = f"確立失敗（{problem.stage}） {problem.detail}"
                     return
                 self.status = "待機中"
-        if self._active or self._manual:
-            request = self.link.current_request
-            if request is not None and now - request.started > timeout:
-                self._stop_for_link_wait(REQUEST_PENDING, request.stage, now - request.started)
-                return
+        request = self.link.current_request
+        if request is not None and request != self._timed_out_request and now - request.started > timeout:
+            self._timed_out_request = request
+            elapsed = now - request.started
+            display = None
+            if not (self._active or self._manual):
+                display = f"{REQUEST_PENDING}（{request.stage}・{elapsed:.1f} 秒経過）"
+            self._stop_for_link_wait(REQUEST_PENDING, request.stage, elapsed, display=display)
+            return
         if not self._active or self._flight or self._manual:
             return
         # Each grid can try once in its lead window even during backoff.
@@ -344,10 +366,10 @@ class Scheduler:
                 if in_lead:
                     self._next.lead_retry_attempted = True
 
-    def _stop_for_link_wait(self, reason, stage, elapsed):
-        self.link_wait_reason = reason
+    def _stop_for_link_wait(self, reason, stage, elapsed, *, display=None):
+        self.link_wait_reason = display or reason
         self.log.emit("error", reason=reason, stage=stage, elapsed_ms=elapsed * 1000)
-        self._stop(reason)
+        self._stop(self.link_wait_reason)
 
     def _read_check(self, plan):
         if plan.check is None or not plan.check.done():
@@ -435,12 +457,26 @@ class Scheduler:
             self._record(plan, result.result(), update_status=self.status != SCHEDULE_RANGE_ERROR)
             self._sync_protection()
 
+    def _prune_done(self, wall):
+        cutoff = max(wall, datetime.min + DONE_RETENTION) - DONE_RETENTION
+        if cutoff - self._done_cutoff < DONE_PRUNE_INTERVAL:
+            return
+        self._done_cutoff = cutoff
+        expired = {grid for grid in self._done if grid <= cutoff}
+        if expired:
+            self._done_through = max(self._done_through, max(expired))
+            self._done.difference_update(expired)
+
     def _record(self, plan, outcome, *, remember_grid=True, update_status=True):
         plan.ticket.cancel()
         if remember_grid and plan.grid is not None:
             if plan.grid in self._done:
                 return
-            self._done.add(plan.grid)
+            if plan.grid <= self._done_cutoff:
+                # Catch-up can record expired slots before the next pruning pass.
+                self._done_through = max(self._done_through, plan.grid)
+            else:
+                self._done.add(plan.grid)
         self.log.emit(
             "result", **plan.ticket.fields(), result=outcome.result,
             reason=outcome.reason, error_code=outcome.error_code,

@@ -69,6 +69,10 @@ def _exception(stage: str, error: Exception, kind: str = OPERATION_ERROR) -> Pro
     return Problem(stage, kind, str(error), hresult)
 
 
+def _invalid_return_type(stage, value):
+    return Problem(stage, OPERATION_ERROR, f"{stage}={value!r}（型: {type(value).__name__}、int が必要です）")
+
+
 @dataclass(frozen=True)
 class Reading:
     state: int | None
@@ -292,7 +296,7 @@ class _ComObject:
 class _StartReply:
     returned_at: datetime
     returned: float
-    retval: int | None = None
+    retval: int | str | None = None  # A malformed return is recorded as repr on the owner thread.
     problem: Problem | None = None
 
 
@@ -421,14 +425,18 @@ class LoggerLink:
             elif self._server is not None:
                 existing = self._read_state("establish.GetState")
                 values["previous_GetState"] = existing.state
-                if self.connected:
+                if existing.problem:
+                    values["previous_GetState_error"] = existing.problem.fields()
+                    values["recreate_after_state_error"] = True
+                    self._release()
+                elif self.connected:
                     if can_start(existing.state):
                         return None
                     problem = Problem(stage, OPERATION_ERROR, f"GetState={existing.state}")
                     return problem
-                if self._server is not None:
-                    if existing.problem or existing.state in ACTIVE_STATES:
-                        problem = existing.problem or Problem(stage, OPERATION_ERROR, "前の収集が完了していません")
+                else:
+                    if existing.state in ACTIVE_STATES:
+                        problem = Problem(stage, OPERATION_ERROR, "前の収集が完了していません")
                         return problem
                     stage = "Quit"
                     values["previous_Quit"] = self._server.Quit()
@@ -445,8 +453,13 @@ class LoggerLink:
             self._server.Visible = self.config.visible
             values[stage] = self.config.visible
             stage = "SetIdentifier"
-            values[stage] = self._server.SetIdentifier(self.config.identifier)
-            if values[stage] != 0:
+            retval = self._server.SetIdentifier(self.config.identifier)
+            if type(retval) is not int:
+                values[stage] = repr(retval)
+                problem = _invalid_return_type(stage, retval)
+                return problem
+            values[stage] = retval
+            if retval != 0:
                 problem = Problem(stage, OPERATION_ERROR, "他の WAVE LOGGER が使用中")
                 return problem
             if not self._simple:
@@ -456,8 +469,13 @@ class LoggerLink:
                     problem = Problem(stage, OPERATION_ERROR, "機器 ID が一致しません")
                     return problem
             stage = "OpenFile"
-            values[stage] = self._server.OpenFile(self.config.settings_file)
-            if values[stage] != 0:
+            retval = self._server.OpenFile(self.config.settings_file)
+            if type(retval) is not int:
+                values[stage] = repr(retval)
+                problem = _invalid_return_type(stage, retval)
+                return problem
+            values[stage] = retval
+            if retval != 0:
                 problem = Problem(stage, OPERATION_ERROR, "OpenFile が失敗しました")
                 return problem
             if self._simple:
@@ -571,6 +589,9 @@ class LoggerLink:
             if problem.reason == DISCONNECTED:
                 self._link_down(problem)
             return problem
+        if type(retval) is not int:
+            fields["open_file_retval"] = repr(retval)
+            return _invalid_return_type(stage, retval)
         fields["open_file_retval"] = retval
         if retval != 0:
             return Problem(stage, OPERATION_ERROR, f"OpenFile={retval}")
@@ -598,9 +619,15 @@ class LoggerLink:
             result = reading
             if reading.problem is None and self._file_type_baseline is not None:
                 problem = self._check_settings_file(ticket, deadline, fields)
-                if problem is None:
+                if fields.get("reopen_success"):
+                    after = self._read_state("precheck.GetState")
+                    fields["state_after_reopen"] = after.state
+                    fields["observed_at_after_reopen"] = after.observed_at
+                    problem = after.problem
+                    result = after
+                elif problem is None:
                     result = replace(reading, finished=monotonic())
-                else:
+                if problem is not None:
                     fields.update(problem.fields())
                     result = problem
             self.log.emit("precheck", **ticket.fields(), **fields)
@@ -657,7 +684,11 @@ class LoggerLink:
             if problem.reason == DISCONNECTED:
                 self._link_down(problem)
             return _StartReply(returned_at, returned, problem=problem)
-        return _StartReply(local_now(), monotonic(), retval=retval)
+        returned_at, returned = local_now(), monotonic()
+        if type(retval) is not int:
+            problem = _invalid_return_type("Start", retval)
+            return _StartReply(returned_at, returned, repr(retval), problem)
+        return _StartReply(returned_at, returned, retval)
 
     def _finish_fire(self, result, call, ticket, deadline, before, dispatched_at):
         def log_fire(reply, late=False):
@@ -690,7 +721,10 @@ class LoggerLink:
                     label = UNKNOWN if ticket.started is not None else SKIPPED
                     outcome = FireResult(label, reply.detail, problem=reply)
                 elif reply.problem:
-                    outcome = FireResult(UNKNOWN, reply.problem.reason, problem=reply.problem)
+                    if reply.retval is None:
+                        outcome = FireResult(UNKNOWN, reply.problem.reason, problem=reply.problem)
+                    else:
+                        outcome = FireResult(FAILED, reply.problem.detail, problem=reply.problem)
                 elif reply.retval != 0:
                     problem = Problem("Start", OPERATION_ERROR, f"Start={reply.retval}")
                     outcome = FireResult(FAILED, problem.detail, problem=problem)

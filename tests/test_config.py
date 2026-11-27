@@ -64,6 +64,21 @@ def test_unknown_progid_skips_software_combination_validation(config):
     assert updated.software is None
 
 
+def test_normalized_progid_validates_combinations_and_preserves_storage(config, tmp_path):
+    progid = " \twaveloggerxdemo.application  "
+    with pytest.raises(ValueError, match=r"WAVE LOGGER X .*NR-600"):
+        replace(config, progid=progid)
+    with pytest.raises(ValueError, match=r"無印 WAVE LOGGER.*simple"):
+        replace(config, progid=" wavelogger2.application ", logger_model="NR-500")
+
+    updated = replace(config, progid=progid, logger_model="NR-X100", unit_id=2)
+    path = tmp_path / "config.json"
+    save_config(updated, path)
+    loaded = load_config(path)
+    assert (loaded.progid, loaded.software) == (progid, "X")
+    assert (loaded.identifier, loaded.expected_identifier) == (6, 10)
+
+
 @pytest.mark.parametrize(("key", "value"), [
     ("version", True), ("version", 2), ("unit_id", True), ("unit_id", 4),
     ("unit_id", -1), ("logger_model", "NR-X"), ("lead_seconds", 2),
@@ -237,3 +252,14 @@ def test_cron_seconds_first():
 ])
 def test_tb_sync_cron_examples(expression, expected):
     assert cron_schedule(expression, datetime(2026, 11, 9)).get_next(datetime).isoformat() == expected
+
+
+@pytest.mark.parametrize("cron", ["5/2 * * * * *", "5,10/2 * * * * *"])
+def test_cron_rejects_step_on_single_value(config, cron):
+    with pytest.raises(ValueError, match=r"cron.*刻みは \* または範囲"):
+        replace(config, cron=cron)
+
+
+def test_cron_accepts_step_on_range():
+    slots = cron_schedule("5-15/2 * * * * *", datetime(2026, 11, 9))
+    assert [slots.get_next(datetime).second for _ in range(3)] == [5, 7, 9]

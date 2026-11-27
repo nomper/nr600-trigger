@@ -1,8 +1,8 @@
 # NR-500/600 定期トリガーアプリ 詳細設計書
 
-版: 0.9（間隔指定モードを追加）
-日付: 2026-11-26
-上位文書: 設計書 v1.8（design.md）
+版: 1.0（設計書 v2.2 に追随して現行化：NR-X100 の機器 ID、確立手順の順序、link_mode と組み合わせ検証、解消済みの未決事項を反映）
+日付: 2026-11-28
+上位文書: 設計書 v2.2（design.md）
 使用関数: used-functions.md（必須11・条件付き2・任意3の計16関数）
 
 ## 1. モジュール構成
@@ -34,8 +34,8 @@
 
 | 操作 | 中で使う関数 | 戻り |
 |---|---|---|
-| establish | DispatchEx → Initialize → DisplayAlerts／Visible 設定 → SetIdentifier → GetIdentifier 確認 → OpenFile → GetState → GetActiveFileType（ファイル型の基準値を取り込む） | 確立の成否と失敗段階、各戻り値 |
-| precheck | GetState、GetActiveFileType（基準値と照合。0 なら OpenFile で一度だけ開き直す） | 最新の状態値 |
+| establish | DispatchEx → Initialize → DisplayAlerts／Visible 設定 → SetIdentifier → GetIdentifier 確認 → OpenFile → GetActiveFileType（ファイル型の基準値を取り込む） → GetState | 確立の成否と失敗段階、各戻り値 |
+| precheck | GetState、GetActiveFileType（基準値と照合。0 なら OpenFile で一度だけ開き直し、開き直した後は GetState を取り直してその状態を返す） | 最新の状態値 |
 | fire | Start → GetState ポーリング →（異常停止時）GetErrorCode | 結果区分（第4節） |
 | stop_collect | Stop | 成否 |
 | snapshot | GetState、GetModuleName、GetUnitInfo | 画面表示・ログ用の現在状態 |
@@ -43,7 +43,7 @@
 
 - オブジェクトの生成は **DispatchEx** を使い、新規インスタンスの生成を明示する（Dispatch は既存オブジェクトへの接続を先に試すため使わない）。操作できるのはオートメーションから起動したインスタンスだけ、という制約に沿う。
 - ProgID は設定から受け取る（製品版／体験版／X の差し替えはここで吸収する）。
-- **機器 ID の設定は必須**。オートメーション起動直後の対応機器 ID は「未設定」で、設定しないと収集できない（マニュアル第6章）。設定は物理 ID（0〜3）とロガー型式から API 引数を計算する：NR-500・USB は 0〜3、NR-600・USB は 4〜7。SetIdentifier の戻り値が有効な引数でも 0 以外なら「他の WAVE LOGGER が使用中」として確立失敗にする。GetIdentifier の取得値が**型式ごとの期待値**（NR-600：8＋物理 ID、NR-500：物理 ID）と一致することも確立条件に含める。期待値は SetIdentifier の引数とは別の空間で、NR-600 側は体験版サーバーの実測（2026-11-26、設定 4〜7 に対し取得値 8〜11）に基づく。NR-500 側は体験版で模擬できずマニュアルどおりの前提とし、製品版の受入で確認する（設計書 第8節 項目11）。
+- **機器 ID の設定は必須**。オートメーション起動直後の対応機器 ID は「未設定」で、設定しないと収集できない（マニュアル第6章）。設定は物理 ID（0〜3）とロガー型式から API 引数を計算する：NR-500・USB は 0〜3、NR-600・USB と NR-X100・USB は 4〜7。SetIdentifier の戻り値が有効な引数でも 0 以外なら「他の WAVE LOGGER が使用中」として確立失敗にする。GetIdentifier の取得値が**型式ごとの期待値**（NR-600：8＋物理 ID、NR-500：物理 ID、NR-X100：8＋物理 ID）と一致することも確立条件に含める。期待値は SetIdentifier の引数とは別の空間で、NR-600 側は体験版サーバーの実測（2026-11-26、設定 4〜7 に対し取得値 8〜11）に基づく。NR-500 側は体験版で模擬できずマニュアルどおりの前提とし、製品版の受入で確認する（設計書 第8節 項目11）。NR-X100 側は NR-600 と同じ並びという類推で、X では未検証（受入 項目14で確認する）。
 - GetState の値の意味づけは logger_link 内の1箇所に集約する。**開始可能は停止＝1 のみ**とする。開始待ち＝2 で Start が受理される根拠はマニュアルに確認できないため、実機確認までは開始不可として扱う。8（未定義）・9（ゼロ点調整中）・未知値も開始不可とし、取得値をログに残す。収集中＝3〜7・12、読み出し中＝10、エラー停止＝11、負数＝状態取得異常。
 
 ### 2.3 確立の排他と切断・再確立
@@ -52,8 +52,9 @@
 - 確立の途中で失敗したら（OpenFile の非ゼロ、SetIdentifier の失敗、例外など）、途中まで生成した参照を STA 上で片付けてから失敗を返す。
 - 異常は記録上区別する：状態取得異常（GetState の負数・例外）、操作エラー（各操作の戻り値・COM 例外）、サーバー切断（WAVE LOGGER PRO が先に終了）。
 - サーバー切断と判定したら、その回の発火は見送る。旧参照を無効化してから、次回発火のリード時刻までに再確立を試みる。リトライで発火を遅らせない。
-- 確立の完了条件には、OpenFile 後に取得するファイル型（GetActiveFileType）が 1／2／3 のいずれかであることを含む。取得できない・範囲外の場合は確立失敗とする（基準値が無いまま、閉鎖検出・開き直しを無効化しないため）。
-- COM 無応答の監視：LoggerLink は実行中の STA 要求（要求名と単調時計の開始時刻）を公開する。確立の Future と実行中の要求は 30 秒（Timing.request_timeout）を上限に監視し、超過したら「確立が応答待ち」／「収集ソフトが応答待ち」として停止し、要求名と経過時間をエラーに残す。応答待ちの確立 Future が未完了の間は新たな確立を始めず、遅れて完了した結果は破棄する。自動復旧はしない。
+- 既存サーバーの再利用時に状態が読めない（状態取得異常）場合は、そのサーバーは Quit せず参照だけを捨て、新規の DispatchEx から確立をやり直す（1回だけ）。状態が有効値の場合は作り直さない。
+- 確立の完了条件には、OpenFile 後に取得するファイル型（GetActiveFileType）が有効値（PRO は 1／2／3、X は 1／2）であることを含む。取得できない・範囲外の場合は確立失敗とする（基準値が無いまま、閉鎖検出・開き直しを無効化しないため）。
+- COM 無応答の監視：LoggerLink は実行中の STA 要求（要求名と単調時計の開始時刻）を公開する。確立の Future と実行中の要求は 30 秒（Timing.request_timeout）を上限に監視し、超過したら「確立が応答待ち」／「収集ソフトが応答待ち」として停止し、要求名と経過時間をエラーに残す。実行中の要求の監視はスケジューラの運転状態によらない（停止中の収集停止・状態取得も対象）。応答待ちの確立 Future が未完了の間は新たな確立を始めず、遅れて完了した結果は破棄する。自動復旧はしない。
 - シンプルモード（設定 `link_mode = "simple"`、設計書 第5.6節）：確立は SetIdentifier と OpenFile の戻り値だけで判定し、GetIdentifier 照合・ファイル型確認・GetState 確認を行わない。既存サーバーが未接続で残っている場合は Quit を試みてから作り直す。事前確認は STA を使わず、状態なし（ログ上は state=null）の開始可能な Reading を完了済み Future で返すことで、スケジューラ側の変更なしに発火へ進める。スナップショットも COM を使わず state=null を返す。終了時は GetState を読まずに Quit を直接試みる。
 
 ### 2.4 終了手順（close）
@@ -106,17 +107,19 @@ Quit は収集中は実行できず、未保存データを破棄する（マニ
   "settings_file": "C:\\path\\to\\condition.xxx",
   "logger_model": "NR-600",
   "unit_id": 0,
+  "link_mode": "full",
   "mode": "cron",
   "cron": "0 * * * * *",
   "anchor": null,
   "interval_minutes": null,
   "lead_seconds": 5,
-  "visible": true,
+  "visible": false,
   "log_retention_days": 30
 }
 ```
 
-- `logger_model`（NR-600／NR-500）と `unit_id`（物理 ID 0〜3）から、SetIdentifier の引数を計算する（NR-500・USB：unit_id、NR-600・USB：4＋unit_id）。
+- `logger_model`（NR-600／NR-500／NR-X100）と `unit_id`（物理 ID 0〜3）から、SetIdentifier の引数を計算する（NR-500・USB：unit_id、NR-600・USB と NR-X100・USB：4＋unit_id）。
+- `link_mode` は `full`（既定）または `simple`。収集ソフトとロガーとリンクモードの組み合わせを検証する：PRO は NR-600／NR-500、X は NR-X100／NR-500、無印は NR-500 のみで `simple` のみ。ProgID の判定は前後空白と大文字小文字を正規化して行い、未知の ProgID は検証をスキップする。
 - `lead_seconds` の検証範囲は 3〜5。
 - `mode` は `cron`（既定）または `interval`。旧形式の設定ファイル（mode なし）は cron として読み込む（後方互換）。
 - cron 指定では `cron` が必須で、従来どおり検証する。間隔指定では `anchor` と `interval_minutes` が必須で、`anchor` は `yyyymmdd hhmmss` 形式（`yyyy-mm-dd hh:mm:ss`、`yyyy/mm/dd hh:mm:ss` も受理）をローカル時刻として解釈し、`interval_minutes` は 1 以上の整数とする。使わない方式の項目は検証しない（切り替え前の値を保持できる）。
@@ -157,5 +160,5 @@ Quit は収集中は実行できず、未保存データを破棄する（マニ
 - Start はその時点のアクティブウィンドウの収集条件で開始する。スケジューラ動作中に利用者がファイルを切り替えると固定条件の前提が崩れるため、**動作中はファイル切り替えをしない**ことを運用条件とし、手順書にも書く。
 - 手順書に含める追加事項：インストール後に一度だけ WAVE LOGGER PRO を手動で起動・終了しておくこと（これをしないとオートメーションが使えない。マニュアル §6.1）、設定ファイルの Excel 転送設定を OFF にすること。
 - 収録条件の設定ファイルの拡張子・形式は WAVE LOGGER PRO 側の仕様に従う（実ファイルでの確認は受入時）。
-- NR-500 の収集ソフトは PRO の見込み（本番環境で確認待ち）。X だった場合は ProgID 差し替え＋GetStartupState の利用可否を再検討する。
-- アプリ名・exe 名は未決（設計書 第10節）。
+- NR-500 の収集ソフトは無印 WAVE LOGGER と確定した（2026-11-27、実機環境の確認）。シンプルモード（設計書 第5.6節）で対応する。
+- アプリ名・exe 名は NR-Trigger／NR-Trigger.exe に決定した（2026-11-27、v1.0.0 で正式版として公開）。
