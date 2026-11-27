@@ -27,6 +27,7 @@ def test_expected_identifier(config, model, offset):
     ("cron", " "), ("cron", None), ("cron", "* * * * *"), ("cron", "60 * * * * *"),
     ("cron", "0 0 0 31 2 *"), ("mock", None), ("mock", {"scenario": "unknown"}),
     ("mock", {"scenario": "delay", "delay_seconds": "1"}),
+    ("link_mode", "unknown"), ("link_mode", None), ("link_mode", ["simple"]),
 ])
 def test_invalid_json_settings(tmp_path, config, key, value):
     path = tmp_path / "config.json"
@@ -53,11 +54,14 @@ def test_defaults_and_required_fields(tmp_path, config):
     path = tmp_path / "config.json"
     save_config(config, path)
     values = json.loads(path.read_text(encoding="utf-8"))
-    for name in ("mode", "anchor", "interval_minutes", "lead_seconds", "visible", "log_retention_days"):
+    for name in (
+        "mode", "anchor", "interval_minutes", "lead_seconds", "visible", "log_retention_days", "link_mode",
+    ):
         del values[name]
     path.write_text(json.dumps(values), encoding="utf-8")
     loaded = load_config(path)
     assert loaded.visible is False
+    assert loaded.link_mode == "full"
     assert loaded == config
     values["visible"] = True
     path.write_text(json.dumps(values), encoding="utf-8")
@@ -66,6 +70,14 @@ def test_defaults_and_required_fields(tmp_path, config):
     path.write_text(json.dumps(values), encoding="utf-8")
     with pytest.raises(ValueError, match="progid"):
         load_config(path)
+
+
+def test_save_and_load_simple_link_mode(tmp_path, config):
+    path = tmp_path / "config.json"
+    expected = replace(config, link_mode="simple")
+    save_config(expected, path)
+    assert json.loads(path.read_text(encoding="utf-8"))["link_mode"] == "simple"
+    assert load_config(path) == expected
 
 
 @pytest.mark.parametrize("text", [

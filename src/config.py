@@ -129,6 +129,7 @@ class Config:
     visible: bool = False
     log_retention_days: int = 30
     mock: MockConfig | None = None
+    link_mode: str = "full"
 
     def __post_init__(self):
         if type(self.version) is not int or self.version != 1:
@@ -151,6 +152,8 @@ class Config:
             raise ValueError("mock は設定オブジェクトを指定してください")
         if self.mode not in ("cron", "interval"):
             raise ValueError("mode は cron または interval を指定してください")
+        if self.link_mode not in ("full", "simple"):
+            raise ValueError("link_mode は full または simple を指定してください")
         if self.mode == "cron":
             if not isinstance(self.cron, str) or not self.cron.strip():
                 raise ValueError("cron は空でない文字列を指定してください")

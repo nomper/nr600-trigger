@@ -10,7 +10,7 @@ import pytest
 from src.config import MockConfig
 from src.logbook import Logbook
 from src.logger_link import (
-    CONFIRMED, DISCONNECTED, FAILED, OPERATION_ERROR, SKIPPED, UNCONFIRMED, UNKNOWN, Problem, Timing,
+    CONFIRMED, DISCONNECTED, FAILED, OPERATION_ERROR, SENT, SKIPPED, UNCONFIRMED, UNKNOWN, Problem, Timing,
 )
 from src.mock_link import MockLink, _MockServer
 from src.scheduler import Scheduler
@@ -115,6 +115,16 @@ def test_scheduled_result(rig, scenario, result, starts):
         wait_for(lambda: link.connected)
         assert len(events(log, "establish")) == 2
         assert events(log, "link_up")[-1]["down_ms"] > 0
+
+
+def test_simple_scheduled_result(rig):
+    scheduler, link, log, _ = rig(link_mode="simple")
+
+    assert scheduler.start()
+    outcome = log.results.get(timeout=2.5)
+    assert outcome["result"] == SENT and outcome["reason"] == "Start=0"
+    assert link.start_count == 1
+    assert not events(log, "observe")
 
 
 @pytest.mark.parametrize("skip_middle", [False, True], ids=["all-fire", "skip-while-collecting"])

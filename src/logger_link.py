@@ -27,6 +27,7 @@ UNKNOWN = "結果不明"
 FAILED = "開始失敗"
 CONFIRMED = "開始確認済み"
 UNCONFIRMED = "送信済み・未確認"
+SENT = "送信済み"
 
 STATE_ERROR = "状態取得異常"
 OPERATION_ERROR = "操作エラー"
@@ -302,6 +303,7 @@ class LoggerLink:
         self.config = config
         self.log = log
         self.timing = timing
+        self._simple = config.link_mode == "simple"
         self._gate = RLock()
         self._server = None  # Accessed only on the owner thread.
         self._file_type_baseline: int | None = None  # Accessed only on the owner thread.
@@ -408,7 +410,15 @@ class LoggerLink:
         problem = None
         created = False
         try:
-            if self._server is not None:
+            if self._server is not None and self._simple:
+                if self.connected:
+                    return None
+                try:
+                    values["previous_Quit"] = self._server.Quit()
+                except Exception:
+                    pass
+                self._release()
+            elif self._server is not None:
                 existing = self._read_state("establish.GetState")
                 values["previous_GetState"] = existing.state
                 if self.connected:
@@ -439,16 +449,20 @@ class LoggerLink:
             if values[stage] != 0:
                 problem = Problem(stage, OPERATION_ERROR, "他の WAVE LOGGER が使用中")
                 return problem
-            stage = "GetIdentifier"
-            values[stage] = self._server.GetIdentifier()
-            if values[stage] != self.config.expected_identifier:
-                problem = Problem(stage, OPERATION_ERROR, "機器 ID が一致しません")
-                return problem
+            if not self._simple:
+                stage = "GetIdentifier"
+                values[stage] = self._server.GetIdentifier()
+                if values[stage] != self.config.expected_identifier:
+                    problem = Problem(stage, OPERATION_ERROR, "機器 ID が一致しません")
+                    return problem
             stage = "OpenFile"
             values[stage] = self._server.OpenFile(self.config.settings_file)
             if values[stage] != 0:
                 problem = Problem(stage, OPERATION_ERROR, "OpenFile が失敗しました")
                 return problem
+            if self._simple:
+                self._link_up()
+                return None
             stage = "establish.GetActiveFileType"
             file_type = self._read_file_type(stage)
             if isinstance(file_type, Problem):
@@ -488,6 +502,7 @@ class LoggerLink:
     def _log_establish(self, started, values, problem, *, file_type_baseline=None):
         self.log.emit(
             "establish", progid=self.config.progid, settings_file=self.config.settings_file,
+            link_mode=self.config.link_mode,
             unit_id=self.config.unit_id, identifier=self.config.identifier,
             expected_identifier=self.config.expected_identifier,
             confirmed_identifier=values.get("GetIdentifier"), success=problem is None,
@@ -593,6 +608,13 @@ class LoggerLink:
         with self._gate:
             if self._closing or self._firing or not self._ready:
                 return None
+            if self._simple:
+                # The scheduler accepts state 1 as permission to send Start.
+                reading = Reading(state=1, observed_at=local_now(), finished=monotonic())
+                self.log.emit("precheck", **ticket.fields(), state=None, link_mode="simple")
+                future = Future()
+                future.set_result(reading)
+                return future
             return self._submit("precheck.GetState", read)
 
     def fire(self, ticket, deadline, window=None):
@@ -671,6 +693,8 @@ class LoggerLink:
                 elif reply.retval != 0:
                     problem = Problem("Start", OPERATION_ERROR, f"Start={reply.retval}")
                     outcome = FireResult(FAILED, problem.detail, problem=problem)
+                elif self._simple:
+                    outcome = FireResult(SENT, "Start=0")
                 else:
                     outcome = self._observe(ticket, reply.returned)
         except Exception as error:
@@ -785,6 +809,10 @@ class LoggerLink:
         with self._gate:
             if self._protect or self._closing or not self._ready:
                 return None
+            if self._simple:
+                future = Future()
+                future.set_result({"state": None, "link_mode": "simple"})
+                return future
             return self._submit("snapshot", read)
 
     def stop_collect(self):
@@ -839,10 +867,13 @@ class LoggerLink:
     def _quit(self, deadline):
         if self._server is None:
             return True
-        reading = self._read_state("close.GetState")
-        if self._server is None:
-            return True
-        if reading.problem or reading.state in ACTIVE_STATES or monotonic() >= deadline:
+        if not self._simple:
+            reading = self._read_state("close.GetState")
+            if self._server is None:
+                return True
+            if reading.problem or reading.state in ACTIVE_STATES:
+                return False
+        if monotonic() >= deadline:
             return False
         try:
             self._server.Quit()
